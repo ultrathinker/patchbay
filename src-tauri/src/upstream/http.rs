@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex as TokioMutex};
 
 use reqwest::header::{HeaderName, HeaderValue};
 
@@ -73,6 +73,11 @@ pub struct HttpClient {
     /// Set after a successful `initialize` so subsequent requests carry the
     /// negotiated `MCP-Protocol-Version` header (FIX 12b; some servers require it).
     initialized: AtomicBool,
+    /// Serializes reinitialize attempts (FIX: stale session auto-recovery) so a
+    /// burst of concurrent calls hitting a stale session don't each fire their
+    /// own `initialize` — the first waiter reinitializes, the rest see the
+    /// fresh `session_id` and skip straight to retrying their own request.
+    reinit_lock: TokioMutex<()>,
     /// Signals to the manager's supervisor (list_changed / exit).
     event_tx: mpsc::UnboundedSender<ClientEvent>,
 }
@@ -115,6 +120,7 @@ impl HttpClient {
             next_id: AtomicI64::new(1),
             closed: AtomicBool::new(false),
             initialized: AtomicBool::new(false),
+            reinit_lock: TokioMutex::new(()),
             event_tx,
         });
         (client, event_rx)
@@ -160,14 +166,95 @@ impl HttpClient {
     /// POST a JSON-RPC request and return its `result` field (or `Err` on a
     /// JSON-RPC error / transport failure). Handles both `application/json` and
     /// `text/event-stream` responses.
+    ///
+    /// Auto-recovers from a stale `Mcp-Session-Id` (FIX: the upstream — e.g. a
+    /// restarted tabduct hub — forgot our session): a `SessionInvalid` on
+    /// anything but `initialize` itself triggers one transparent
+    /// reinitialize-then-retry before the caller ever sees an error. This is
+    /// invisible from the gateway/tray's point of view: a jack that looks
+    /// "Running" keeps working across an upstream restart instead of failing
+    /// every call forever until the user manually toggles it.
     async fn request(
         &self,
         method: &str,
         params: Option<Value>,
         timeout: Duration,
     ) -> Result<Value, String> {
+        match self.send_once(method, params.clone(), timeout).await {
+            Ok(v) => Ok(v),
+            Err(ReqErr::SessionInvalid) if method != "initialize" => {
+                self.reinitialize_then_retry(method, params, timeout).await
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Reinitialize (deduped via `reinit_lock` — a burst of concurrent callers
+    /// all hitting the same stale session only reinitializes once) and retry
+    /// the original request exactly once. If the retry hits `SessionInvalid`
+    /// again, that's a real failure (not just a stale-session race) and is
+    /// surfaced as-is rather than looping.
+    async fn reinitialize_then_retry(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        {
+            let _guard = self.reinit_lock.lock().await;
+            // Another waiter may have already reinitialized while we queued for
+            // the lock — only do it ourselves if the session is still empty.
+            if self.session_id.lock().is_none() {
+                log(&format!(
+                    "[jack:{}] stale session detected; reinitializing",
+                    self.name
+                ));
+                self.do_initialize().await?;
+            }
+        }
+        self.send_once(method, params, timeout)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// The actual handshake logic (params + `initialize` + `notifications/initialized`),
+    /// shared by the initial connect and by stale-session recovery. Clears the
+    /// old session id first so a failed attempt never resends an id we know is dead.
+    async fn do_initialize(&self) -> Result<(), String> {
+        *self.session_id.lock() = None;
+        self.initialized.store(false, Ordering::SeqCst);
+        let params = json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {
+                "name": "patchbay",
+                "version": env!("CARGO_PKG_VERSION"),
+            }
+        });
+        // Bypass `request()`'s own retry wrapper (would recurse): "initialize"
+        // is already excluded there, but call send_once directly for clarity.
+        self.send_once("initialize", Some(params), HANDSHAKE_TIMEOUT)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.notify("notifications/initialized", None).await?;
+        self.initialized.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// One HTTP round-trip for a JSON-RPC request — no retry, no reinitialize.
+    /// Returns [`ReqErr::SessionInvalid`] when the upstream's response is
+    /// unmistakably "your `Mcp-Session-Id` is gone" (HTTP 400 + JSON-RPC error
+    /// code -32000, the code the MCP spec reserves for this), so the caller can
+    /// decide whether a retry is appropriate; any other non-success status is
+    /// [`ReqErr::Other`].
+    async fn send_once(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value, ReqErr> {
         if self.closed.load(Ordering::SeqCst) {
-            return Err("http upstream shut down".to_string());
+            return Err(ReqErr::Other("http upstream shut down".to_string()));
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         // Omit `params` entirely when there are none — a strict JSON-RPC server
@@ -186,13 +273,27 @@ impl HttpClient {
 
         let resp = tokio::time::timeout(timeout, builder.send())
             .await
-            .map_err(|_| format!("upstream timeout after {:?}", timeout))?
-            .map_err(|e| format!("http request: {}", e))?;
+            .map_err(|_| ReqErr::Other(format!("upstream timeout after {:?}", timeout)))?
+            .map_err(|e| ReqErr::Other(format!("http request: {}", e)))?;
 
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(format!("upstream HTTP {}: {}", status, truncate(&text, 200)));
+            if status == reqwest::StatusCode::BAD_REQUEST && is_session_invalid_body(&text) {
+                // Clear the now-dead id immediately (not just inside
+                // `do_initialize`): `reinitialize_then_retry`'s dedup guard
+                // checks `session_id.lock().is_none()` to decide whether a
+                // reinitialize is still needed. Without clearing it here, the
+                // guard would see the OLD (stale) id, conclude nothing needs
+                // to happen, and retry with the exact same dead id forever.
+                *self.session_id.lock() = None;
+                return Err(ReqErr::SessionInvalid);
+            }
+            return Err(ReqErr::Other(format!(
+                "upstream HTTP {}: {}",
+                status,
+                truncate(&text, 200)
+            )));
         }
 
         // Capture / refresh the server-issued session id (first seen on the
@@ -213,20 +314,26 @@ impl HttpClient {
             .unwrap_or(false);
 
         let envelope = if is_sse {
-            self.read_sse_until(resp, id, timeout).await?
+            self.read_sse_until(resp, id, timeout)
+                .await
+                .map_err(ReqErr::Other)?
         } else {
             // `application/json` (or unknown): exactly one JSON-RPC response.
             let text = resp
                 .text()
                 .await
-                .map_err(|e| format!("read body: {}", e))?;
+                .map_err(|e| ReqErr::Other(format!("read body: {}", e)))?;
             serde_json::from_str::<Value>(&text).map_err(|e| {
-                format!("response JSON parse: {} (body: {})", e, truncate(&text, 200))
+                ReqErr::Other(format!(
+                    "response JSON parse: {} (body: {})",
+                    e,
+                    truncate(&text, 200)
+                ))
             })?
         };
 
         if envelope.get("error").is_some() {
-            return Err(format!("upstream error: {}", envelope));
+            return Err(ReqErr::Other(format!("upstream error: {}", envelope)));
         }
         Ok(envelope.get("result").cloned().unwrap_or(Value::Null))
     }
@@ -365,20 +472,7 @@ impl HttpClient {
 #[async_trait::async_trait]
 impl UpstreamClient for HttpClient {
     async fn initialize(&self) -> Result<(), String> {
-        let params = json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": {
-                "name": "patchbay",
-                "version": env!("CARGO_PKG_VERSION"),
-            }
-        });
-        self.request("initialize", Some(params), HANDSHAKE_TIMEOUT)
-            .await?;
-        self.notify("notifications/initialized", None).await?;
-        // (FIX 12b) Subsequent requests carry the negotiated protocol version.
-        self.initialized.store(true, Ordering::SeqCst);
-        Ok(())
+        self.do_initialize().await
     }
 
     async fn list_tools(&self) -> Result<Vec<Value>, String> {
@@ -417,6 +511,38 @@ impl UpstreamClient for HttpClient {
             .event_tx
             .send(ClientEvent::Exited("shutdown".to_string()));
     }
+}
+
+/// Distinguishes "the upstream doesn't recognize our `Mcp-Session-Id`" (worth
+/// auto-recovering from — reinitialize + retry) from any other HTTP/JSON-RPC
+/// failure (a real error, surfaced to the caller as-is).
+enum ReqErr {
+    SessionInvalid,
+    Other(String),
+}
+
+impl std::fmt::Display for ReqErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReqErr::SessionInvalid => write!(f, "upstream session invalid"),
+            ReqErr::Other(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+/// Is this HTTP 400 body the MCP "no/unknown session" error? Matched on the
+/// JSON-RPC error code the spec reserves for it (-32000) when parseable, with
+/// a substring fallback for servers that reply with a similar but not
+/// byte-for-byte-identical envelope (matches tabduct's
+/// `hosts/node/src/mcp-server.js` "No valid session; initialize first").
+fn is_session_invalid_body(text: &str) -> bool {
+    if let Ok(v) = serde_json::from_str::<Value>(text) {
+        if v.get("error").and_then(|e| e.get("code")).and_then(|c| c.as_i64()) == Some(-32000) {
+            return true;
+        }
+    }
+    let lower = text.to_ascii_lowercase();
+    lower.contains("session") && (lower.contains("initialize first") || lower.contains("no valid"))
 }
 
 // ---- SSE parsing helpers ----------------------------------------------------
@@ -476,6 +602,27 @@ mod tests {
     fn parse_event_data_strips_optional_leading_space() {
         let event = "data:{\"ok\":true}";
         assert_eq!(parse_event_data(event).unwrap(), "{\"ok\":true}");
+    }
+
+    #[test]
+    fn is_session_invalid_body_matches_jsonrpc_dash32000() {
+        let body = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"Mcp-Session-Id not found"}}"#;
+        assert!(is_session_invalid_body(body));
+    }
+
+    #[test]
+    fn is_session_invalid_body_matches_tabduct_style_text_fallback() {
+        // tabduct's mcp-server.js replies with this phrasing rather than a
+        // byte-for-byte JSON-RPC -32000 envelope.
+        assert!(is_session_invalid_body("No valid session; initialize first"));
+        assert!(is_session_invalid_body("no valid session found, please initialize first"));
+    }
+
+    #[test]
+    fn is_session_invalid_body_rejects_unrelated_errors() {
+        assert!(!is_session_invalid_body(r#"{"error":{"code":-32602,"message":"invalid params"}}"#));
+        assert!(!is_session_invalid_body("internal server error"));
+        assert!(!is_session_invalid_body(""));
     }
 
     #[test]
