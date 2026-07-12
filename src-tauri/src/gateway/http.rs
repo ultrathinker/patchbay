@@ -176,34 +176,38 @@ pub async fn post_mcp(
         let session = header_val.and_then(|id| state.sessions.get(id));
         match session {
             Some(s) => handlers::dispatch(&state, &req, Some(s), None).await,
-            None if header_val.is_some() && method == "tools/call" => {
-                // (dead-session UX fix) A session id WAS supplied but doesn't
-                // resolve. The spec-correct signal is HTTP 404 (below, still
-                // used for every OTHER method) — but in practice, several
-                // real MCP clients only surface transport-level errors to
-                // their own retry/reconnect logic and never let the MODEL
-                // see them, so a model that could otherwise just call
-                // `initialize` again never gets the chance: the client keeps
-                // silently re-sending the same dead session id forever.
-                //
-                // `tools/call` specifically is worth special-casing because
-                // its result IS something the model reads verbatim (same
-                // D2 principle as the unpatched-jack CallToolResult text
-                // elsewhere in this gateway) — so instead of a transport
-                // error, return an ordinary 200 JSON-RPC success whose
-                // CallToolResult carries explicit, model-actionable
-                // instructions. This reaches the model through the exact
-                // same path a normal tool result would, regardless of how
-                // unsophisticated the client's own transport-error handling
-                // is.
-                log("http: POST tools/call -> 200 (dead session, model-directed reinitialize text)");
-                let result = json!({
-                    "content": [{
-                        "type": "text",
-                        "text": "Your MCP session with Patchbay is no longer valid (it expired, or Patchbay restarted). This is not a tool failure. Call 'initialize' again to start a fresh session, then retry this tool call. If this is your very first connection to Patchbay, the user may need to approve access via a dialog on their screen before tools become available — after reinitializing, wait a few seconds for that approval, then retry."
-                    }],
-                    "isError": true
-                });
+            // (dead/missing-session UX fix, D2) No live session resolves for
+            // this request — either a session id WAS supplied but doesn't
+            // resolve (expired, or Patchbay restarted and lost all sessions),
+            // or none was sent at all (never called `initialize`). The
+            // spec-correct signal is HTTP 404/400 (the `None` arm below,
+            // still used for every method with no model-visible result
+            // shape) — but in practice, several real MCP clients only
+            // surface transport-level errors to their own retry/reconnect
+            // logic and never let the MODEL see them, so a model that could
+            // otherwise just call `initialize` again (or tell the user what
+            // to do) never gets the chance: the client keeps silently
+            // re-sending the same dead/absent session forever.
+            //
+            // `tools/call` and `tools/list` are worth special-casing because
+            // their result IS something the model reads verbatim — a
+            // CallToolResult's `content` for the former, and a tool's own
+            // `name`/`description` (literally what tells the model what it
+            // can do) for the latter. Instead of a transport error, return an
+            // ordinary 200 JSON-RPC success carrying explicit, model-readable
+            // instructions in that shape. This reaches the model through the
+            // exact same path a normal result would, regardless of how
+            // unsophisticated the client's own transport-error handling is.
+            None if header_val.is_some() && (method == "tools/call" || method == "tools/list") => {
+                log(&format!(
+                    "http: POST {} -> 200 (dead session, model-directed reinitialize text)",
+                    method
+                ));
+                let result = if method == "tools/call" {
+                    dead_session_calltool_result(false)
+                } else {
+                    dead_session_toolslist_result(false)
+                };
                 let resp = jsonrpc::success(req.id.clone(), result);
                 return status_json(
                     StatusCode::OK,
@@ -212,15 +216,12 @@ pub async fn post_mcp(
                 );
             }
             None if header_val.is_some() => {
-                // A session id WAS supplied but doesn't resolve (expired, or
-                // the gateway restarted and lost all sessions). Per the MCP
-                // Streamable HTTP spec, 404 (not 400) is the signal a
-                // well-behaved client watches for to automatically start a
-                // fresh session via `initialize` instead of getting stuck
-                // retrying a dead session id forever. (Non-`tools/call`
-                // methods have no natural "model-readable result" shape to
-                // hijack the way `tools/call` does above, so they keep the
-                // spec-correct transport error.)
+                // Every OTHER method (`ping`, `notifications/initialized`,
+                // unknown methods) has no natural "model-readable result"
+                // shape to hijack the way tools/call/tools/list do above, so
+                // it keeps the spec-correct transport error: 404 is the
+                // signal a well-behaved client watches for to automatically
+                // start a fresh session via `initialize`.
                 log(&format!(
                     "http: POST {} -> 404 (session not found/expired, client should reinitialize)",
                     method
@@ -228,7 +229,7 @@ pub async fn post_mcp(
                 let resp = jsonrpc::error(
                     None,
                     jsonrpc::INVALID_REQUEST,
-                    "session not found or expired — reinitialize",
+                    "session not found or expired — call 'initialize' again to start a fresh session (Patchbay likely restarted)",
                     None,
                 );
                 return status_json(
@@ -237,20 +238,20 @@ pub async fn post_mcp(
                     None,
                 );
             }
-            None if method == "tools/call" => {
+            None if method == "tools/call" || method == "tools/list" => {
                 // No session id was sent AT ALL (not even a dead/expired one)
                 // — this client never called `initialize` successfully before
-                // trying to call a tool. Same model-readable-text principle as
-                // the dead-session case above: the model reads this exactly
-                // like a normal tool result and can act on it directly.
-                log("http: POST tools/call -> 200 (no session yet, model-directed initialize text)");
-                let result = json!({
-                    "content": [{
-                        "type": "text",
-                        "text": "You have not established an MCP session with Patchbay yet. Call 'initialize' first, then retry this tool call. If this is your very first connection to Patchbay, the user may need to approve access via a dialog on their screen before tools become available — after initializing, wait a few seconds for that approval, then retry."
-                    }],
-                    "isError": true
-                });
+                // trying to use a tool. Same model-readable-text principle as
+                // the dead-session case above.
+                log(&format!(
+                    "http: POST {} -> 200 (no session yet, model-directed initialize text)",
+                    method
+                ));
+                let result = if method == "tools/call" {
+                    dead_session_calltool_result(true)
+                } else {
+                    dead_session_toolslist_result(true)
+                };
                 let resp = jsonrpc::success(req.id.clone(), result);
                 return status_json(
                     StatusCode::OK,
@@ -283,6 +284,45 @@ pub async fn post_mcp(
     build_response(&outcome)
 }
 
+/// Build the `tools/call` `CallToolResult` (D2) for a dead/missing session —
+/// text the calling MODEL reads verbatim as this tool call's own output,
+/// regardless of how the client's own transport-error handling behaves.
+/// `never_initialized` distinguishes "no session id was sent at all" from "a
+/// session id was sent but doesn't resolve" (worded slightly differently).
+fn dead_session_calltool_result(never_initialized: bool) -> serde_json::Value {
+    let text = if never_initialized {
+        "You have not established an MCP session with Patchbay yet. Call 'initialize' first, then retry this tool call. If this is your very first connection to Patchbay, the user may need to approve access via a dialog on their screen before tools become available — after initializing, wait a few seconds for that approval, then retry."
+    } else {
+        "Your MCP session with Patchbay is no longer valid (it expired, or Patchbay restarted). This is not a tool failure. Call 'initialize' again to start a fresh session, then retry this tool call. If this is your very first connection to Patchbay, the user may need to approve access via a dialog on their screen before tools become available — after reinitializing, wait a few seconds for that approval, then retry."
+    };
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": true
+    })
+}
+
+/// Build the `tools/list` result (D2) for a dead/missing session: a SINGLE
+/// synthetic tool whose name/description is exactly the kind of thing a model
+/// reads to decide what it can do next — unlike a raw transport error, this
+/// reaches the model even through a client that never surfaces HTTP-level
+/// failures. No real jacks or meta tools are listed (we don't know the
+/// client's identity/permissions without a session). `never_initialized`
+/// mirrors [`dead_session_calltool_result`].
+fn dead_session_toolslist_result(never_initialized: bool) -> serde_json::Value {
+    let description = if never_initialized {
+        "This is a placeholder — Patchbay has no active MCP session for you yet. Call 'initialize' first, then call tools/list again to see the real tools. If this is your very first connection, the user may need to approve access via a dialog on their screen — wait a few seconds after initializing, then retry."
+    } else {
+        "This is a placeholder — your MCP session with Patchbay is no longer valid (it expired, or Patchbay restarted). Call 'initialize' again to start a fresh session, then call tools/list again to see the real tools."
+    };
+    json!({
+        "tools": [{
+            "name": "patchbay__session_expired",
+            "description": description,
+            "inputSchema": { "type": "object", "properties": {} }
+        }]
+    })
+}
+
 // ---- GET /mcp (SSE: canonical per-session notification stream, D3) --------
 
 pub async fn get_mcp(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -297,7 +337,7 @@ pub async fn get_mcp(State(state): State<AppState>, headers: HeaderMap) -> Respo
             log("http: GET /mcp -> 404 (session not found/expired, client should reinitialize)");
             return (
                 StatusCode::NOT_FOUND,
-                "session not found or expired — reinitialize",
+                "session not found or expired — call 'initialize' again to start a fresh session (Patchbay likely restarted)",
             )
                 .into_response();
         }
@@ -540,5 +580,39 @@ mod tests {
         assert!(!is_localhost_origin("https://example.com"));
         assert!(!is_localhost_origin("http://10.0.0.1:39100"));
         assert!(!is_localhost_origin("https://evil.com:443/x"));
+    }
+
+    #[test]
+    fn dead_session_calltool_result_is_a_model_readable_error() {
+        for never_initialized in [true, false] {
+            let v = dead_session_calltool_result(never_initialized);
+            assert_eq!(v["isError"], true);
+            let text = v["content"][0]["text"].as_str().unwrap();
+            assert_eq!(v["content"][0]["type"], "text");
+            assert!(text.contains("initialize"), "must tell the model to call initialize, got: {text}");
+        }
+    }
+
+    #[test]
+    fn dead_session_calltool_result_wording_distinguishes_never_vs_expired() {
+        let never = dead_session_calltool_result(true);
+        let expired = dead_session_calltool_result(false);
+        let never_text = never["content"][0]["text"].as_str().unwrap();
+        let expired_text = expired["content"][0]["text"].as_str().unwrap();
+        assert!(never_text.contains("have not established"));
+        assert!(expired_text.contains("no longer valid"));
+    }
+
+    #[test]
+    fn dead_session_toolslist_result_exposes_one_synthetic_tool() {
+        for never_initialized in [true, false] {
+            let v = dead_session_toolslist_result(never_initialized);
+            let tools = v["tools"].as_array().unwrap();
+            assert_eq!(tools.len(), 1, "no real jacks/meta tools without a resolved session");
+            assert_eq!(tools[0]["name"], "patchbay__session_expired");
+            let desc = tools[0]["description"].as_str().unwrap();
+            assert!(desc.contains("initialize"), "must tell the model to call initialize, got: {desc}");
+            assert_eq!(tools[0]["inputSchema"]["type"], "object");
+        }
     }
 }
