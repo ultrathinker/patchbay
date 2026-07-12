@@ -100,5 +100,8 @@ two-tier logging) and the subsequent security hardening.
   sensitive JSON keys inside logged request params (e.g. a jack's `headers`/`env`
   passed to `patchbay__add_jack`), which header redaction alone could not cover.
 
-[Unreleased]: https://github.com/ultrathinker/patchbay/compare/v1.2.7...HEAD
+[Unreleased]: https://github.com/ultrathinker/patchbay/compare/v1.2.10...HEAD
+[1.2.10]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.10
+[1.2.9]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.9
+[1.2.8]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.8
 [1.2.7]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.7
