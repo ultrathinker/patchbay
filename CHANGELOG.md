@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.10] — 2026-07-12
+
+### Fixed
+- Reverted the 1.2.9 dead-session behavior for an **expired/unresolvable**
+  session id: it now returns the spec-correct HTTP 404 again for every
+  method, including `tools/call` and `tools/list`. Live-testing against a
+  real Claude Code session showed the 1.2.9 "200 + model-readable text"
+  disguise actively prevented a spec-compliant client's own transport-level
+  auto-reconnect from firing — a real 404 lets it silently reinitialize and
+  retry with zero visible disruption. The model-readable-text trick is kept
+  only for a client that never sent a session id at all (no established
+  session for a compliant client to recover from there).
+
+## [1.2.9] — 2026-07-12
+
+### Added
+- Extended the dead/missing-session model-readable-text trick (see 1.2.7)
+  from `tools/call` to `tools/list` too, via a synthetic
+  `patchbay__session_expired` tool — reverted for the expired-session case
+  in 1.2.10 (see above); see that entry for why.
+
+## [1.2.8] — 2026-07-12
+
+### Added
+- **Auto-recover HTTP jacks from a stale upstream session.** A
+  streamable-HTTP jack (e.g. tabduct) that had its `Mcp-Session-Id` forgotten
+  by the upstream (typically after the upstream itself restarts) used to fail
+  every call forever until manually toggled off and on. `HttpClient` now
+  detects the upstream's "session invalid" response and transparently
+  reinitializes before retrying once, deduped across concurrent callers.
+
 ## [1.2.7] — 2026-07-12
 
 First versioned public baseline. This consolidates the initial implementation
@@ -69,5 +100,5 @@ two-tier logging) and the subsequent security hardening.
   sensitive JSON keys inside logged request params (e.g. a jack's `headers`/`env`
   passed to `patchbay__add_jack`), which header redaction alone could not cover.
 
-[Unreleased]: https://github.com/ultrathinker/Patchbay/compare/v1.2.7...HEAD
-[1.2.7]: https://github.com/ultrathinker/Patchbay/releases/tag/v1.2.7
+[Unreleased]: https://github.com/ultrathinker/patchbay/compare/v1.2.7...HEAD
+[1.2.7]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.7

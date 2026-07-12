@@ -34,9 +34,11 @@ off in the Patchbay tray and every connected agent picks it up instantly.
 - **Approval gate.** Optionally require a one-time Allow/Deny Windows dialog the
   first time a brand-new identity connects (off by default).
 - **Honest errors.** Calling an unpatched server returns a clear message to the
-  agent instead of a mystery failure; a stale session gets an explicit
-  "re-initialize" instruction instead of a raw transport error some agents
-  retry forever.
+  agent instead of a mystery failure. A Patchbay restart invalidates every
+  agent's MCP session (in-memory only, unavoidable) — a spec-compliant client
+  (Claude Code included) silently reconnects on its very next tool call, no
+  visible disruption; an agent that never called `initialize` at all gets an
+  explicit instruction instead of a confusing error.
 - **Manage Patchbay from an agent.** Built-in tools `patchbay__add_jack`,
   `patchbay__remove_jack`, `patchbay__list_jacks`, `patchbay__toggle_jack` let a
   connected agent add/remove/flip servers without you touching the config file.

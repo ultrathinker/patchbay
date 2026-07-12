@@ -29,12 +29,20 @@ a database tool it shouldn't, especially in a "production" server nobody
 meant to leave switched on. With Patchbay, a server you've switched off
 isn't just hidden — calling it anyway returns a clear, honest message
 explaining it's turned off, instead of the agent finding some workaround
-or misunderstanding a mysterious error. The same "always tell the agent
-what's actually going on" principle applies if its session with Patchbay
-ever goes stale (e.g. after Patchbay restarts) — instead of a raw
-transport error some agents just retry forever, a dead session now gets
-an explicit instruction back ("re-run initialize", or if it's a brand
-new identity, "wait for the approval prompt").
+or misunderstanding a mysterious error.
+
+Restarting Patchbay (e.g. to install an update) always invalidates
+every agent's existing MCP session — that's unavoidable, session state
+lives only in memory. A well-behaved MCP client (Claude Code included)
+handles this itself: it silently reconnects the moment it sees the
+standard "session not found" signal, with no visible interruption at
+all — confirmed by testing against a live Claude Code session, which
+recovered from a Patchbay restart on its very next tool call without
+any user or agent action. The one case Patchbay does step in for
+itself is an agent that calls a tool having never connected at all
+(skipped 'initialize' entirely) — that gets an explicit instruction
+back instead of a confusing error, since there's no existing session
+for the client to silently recover from.
 
 Beyond turning servers on and off, Patchbay also knows WHICH agent is
 asking. Every agent that connects gets an identity — either a name it
