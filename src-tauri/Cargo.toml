@@ -1,0 +1,70 @@
+[package]
+name = "patchbay"
+version = "1.2.7"
+description = "Patchbay - system-tray MCP gateway that toggles MCP servers for all CLI agents at once"
+authors = ["Patchbay"]
+license = "MIT"
+repository = "https://github.com/ultrathinker/Patchbay"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+tauri = { version = "2.10.2", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Trimmed tokio feature set (MASTER_PLAN D4): NOT "full".
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "net", "signal"] }
+base64 = "0.22"
+chrono = "0.4"
+winreg = "0.52"
+dirs = "5.0"
+# Non-poisoning sync locks: a panic while holding the guard won't poison the
+# lock, so one bug can't cascade into every later .lock() panicking.
+parking_lot = "0.12"
+# Gateway: hand-rolled minimal MCP/JSON-RPC over Streamable HTTP (MASTER_PLAN D1,
+# no `rmcp`). axum 0.8 serves /mcp on Tauri's tokio runtime.
+axum = "0.8"
+# Mcp-Session-Id values + stream ids (uuid v4 strings).
+uuid = { version = "1", features = ["v4"] }
+# S3: SSE notification stream over the canonical per-session channel.
+# ReceiverStream wraps tokio::sync::mpsc::Receiver; futures provides StreamExt::map.
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+# S6: streamable-http upstream client (no rmcp). rustls-tls avoids a native-tls
+# build dependency; `stream` gives Response::bytes_stream() for SSE parsing.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# S6: dyn UpstreamClient trait object shared across transports (stdio + http).
+async-trait = "0.1"
+# Tray "Copy gateway URL": OS clipboard access without needing a window.
+arboard = "3"
+# Two-tier logging (Level 1 diagnostic log). `flexi_logger` provides size-based
+# file rotation + automatic cleanup of old generations; `log` is its facade that
+# our existing `utils::log::log()` now delegates to.
+flexi_logger = "0.31"
+log = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+# DPAPI (secrets) + Job Objects (zero-orphan child kill, used from S4).
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_System_JobObjects",
+    # OpenProcess (assigning a spawned child to the Job Object by pid) lives here.
+    "Win32_System_Threading",
+    # S10c: MessageBoxW for the first-connection approval dialog (blocking Win32
+    # modal run from a plain std thread, signaling the result back to the async
+    # task that's awaiting the `initialize` request).
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# Tuned release profile for a small, fast-startup tray daemon
+# (MASTER_PLAN D4: opt-level="z", lto=true, codegen-units=1, strip=true, panic="abort").
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

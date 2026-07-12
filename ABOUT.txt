@@ -1,0 +1,198 @@
+PATCHBAY
+========
+
+WHAT THIS IS
+------------
+Each AI agent needs to be told which extra tools it's allowed to use —
+a database, a browser, a file store, whatever. Those tool connections are
+called MCP servers. The problem: you've got several agents running on
+this machine (Claude Code, Codex, Kilo, maybe others), and each one wants
+its own copy of the same MCP servers wired into its own config.
+
+Add a new server, you edit it in three places. Turn one off because you
+don't trust it near a production database, you have to remember to turn
+it off in three places too.
+
+Patchbay fixes that by sitting in the middle. You point each agent at
+Patchbay's one address ONCE (shown in the tray tooltip, copyable via
+Settings > Copy gateway URL) instead of at your MCP servers directly.
+From then on, every change happens in Patchbay: it forwards traffic to
+whichever real servers you've switched on and merges their tools into
+one list per agent. Flip a checkbox in the tray — the server disappears
+or reappears for every connected agent at once, no restarts needed for
+agents that support live tool updates (Claude Code does; Codex needs a
+session restart to notice, that's an OpenAI CLI limitation, not a
+Patchbay one).
+
+The whole reason this exists: it's too easy for an agent to quietly call
+a database tool it shouldn't, especially in a "production" server nobody
+meant to leave switched on. With Patchbay, a server you've switched off
+isn't just hidden — calling it anyway returns a clear, honest message
+explaining it's turned off, instead of the agent finding some workaround
+or misunderstanding a mysterious error. The same "always tell the agent
+what's actually going on" principle applies if its session with Patchbay
+ever goes stale (e.g. after Patchbay restarts) — instead of a raw
+transport error some agents just retry forever, a dead session now gets
+an explicit instruction back ("re-run initialize", or if it's a brand
+new identity, "wait for the approval prompt").
+
+Beyond turning servers on and off, Patchbay also knows WHICH agent is
+asking. Every agent that connects gets an identity — either a name it
+reports about itself, or, better, a stable label you choose yourself (see
+"Identifying agents" below) — and Patchbay remembers every identity it
+has ever seen. That identity is what everything else in this file builds
+on: per-agent permission lists, a connect-approval prompt, and the
+ability to fully forget an agent you no longer use.
+
+IDENTIFYING AGENTS
+-------------------
+By default Patchbay identifies a connecting agent by the name it reports
+about itself in the MCP handshake (its "clientInfo.name") — but that
+name isn't something you control, and isn't guaranteed to stay stable
+across an agent's own updates.
+
+For a name you actually choose, set an HTTP header in the agent's own MCP
+connection config:
+
+    X-Patchbay-Client: <whatever label you want>
+
+e.g. "Claude Code - Personal", "Claude Code - Work", "Kilo-Agent". If this
+header is present, it OVERRIDES the self-reported name — Patchbay uses it
+as that agent's permanent identity everywhere (seen-agents list, Custom
+permissions, Forbidden list). This is the recommended way to identify any
+agent you plan to give its own permissions to, since it survives agent
+updates and lets you tell two installs of the same tool apart (e.g. a
+personal vs. a work Claude Code profile).
+
+CONNECT APPROVAL
+------------------
+Settings > "Require approval for new agents" (off by default). When
+turned on, the FIRST time an identity Patchbay has never seen tries to
+connect, a Windows dialog pops up asking Allow or Deny before it gets any
+tools. Allow remembers it as a normal seen agent; Deny adds it straight
+to the Forbidden list (see below) so it's rejected automatically from
+then on, with no further prompts. Once an identity has been seen once
+(allowed or not), it never triggers this dialog again — managing it after
+that is done from the tray, not through pop-ups.
+
+SETTINGS & MENU GUIDE
+----------------------
+The main tray popup lists your MCP servers, which Patchbay calls "jacks",
+as checkboxes — checked means patched in (live, tools visible to every
+agent by default), unchecked means unpatched (off, tools hidden, calls
+rejected with an explanation). Click a checkbox to flip it instantly. The
+tray tooltip always shows whether the gateway is running and how many
+jacks are patched in, plus the URL agents should connect to.
+
+Directly below the jack list: "Settings" (everything below), then
+"About [<version>]" (this file), then "Quit".
+
+Inside "Settings":
+
+  Custom [<enabled>/<total>]
+    A submenu listing every agent identity Patchbay has ever seen. Open
+    any agent's name to see its own nested submenu:
+      - "Enable Custom permissions" — a checkbox. Off (default): this
+        agent just follows the global jack checkboxes like everyone else.
+        On: this agent gets its OWN independent on/off list, seeded from
+        whatever the global list looked like the moment you turned this
+        on, and from then on edited completely separately from the
+        global list and from every other agent's Custom list.
+      - One checkbox per jack, reflecting (and controlling) THIS agent's
+        own effective on/off state once Custom permissions is enabled.
+      - "Delete this agent" — permanently forgets this identity (see
+        "Deleting an agent" below).
+    The "[<enabled>/<total>]" label counts how many agents currently have
+    Custom permissions turned on, out of how many agents Patchbay has
+    ever seen in total.
+
+  Forbidden [<count>]
+    A submenu listing every agent identity Patchbay has ever seen, each
+    as a checkbox labeled "<name> [allowed]" or "<name> [denied]".
+    Checking it denies that identity completely — every request it makes
+    is rejected, regardless of any Custom permissions it has. Unchecking
+    it un-denies it. The "[<count>]" label is how many agents are
+    currently denied.
+
+  Retry gateway
+    If Patchbay's local server failed to start (usually because
+    something else is already using its port), this tries again. Safe
+    to click any time — it's a no-op while the gateway is already
+    healthy. If it still fails, the tooltip keeps showing the problem.
+
+  Reload config
+    Re-reads %APPDATA%\Patchbay\patchbay.json from disk, applies any
+    server changes (start/stop whatever's different), and refreshes
+    every connected agent's tool list. Also picks up a changed "port"
+    value and rebinds the gateway's listener live — no full restart
+    needed. Use this if you (or an AI agent) edited that file by hand —
+    Patchbay doesn't watch it automatically.
+
+  Open config file
+    Opens the config file in a text editor, in case you want to add,
+    remove, or tweak a server by hand.
+
+  Copy gateway URL
+    Puts Patchbay's address on your clipboard — paste it into any
+    MCP-capable agent's settings to connect it through Patchbay.
+
+  Start with Windows
+    Launches Patchbay automatically at login, so your agents' one MCP
+    connection is always there without you thinking about it.
+
+  Require approval for new agents
+    See "Connect approval" above. Off by default.
+
+You can also just ask an AI agent already connected through Patchbay to
+manage Patchbay for you — "add this MCP server", "turn off the
+production database", "list my servers" — instead of touching the
+config file at all. Patchbay exposes built-in tools for exactly that
+(patchbay__add_jack, patchbay__remove_jack, patchbay__list_jacks,
+patchbay__toggle_jack), which any connected agent calls the same way it
+calls any other tool. A newly added server's secrets get encrypted
+automatically, same as everything else.
+
+DELETING AN AGENT
+-------------------
+"Delete this agent" (inside that agent's Custom submenu only) permanently
+purges an identity from Patchbay's memory: it's removed from the
+seen-agents list, its Custom permission list (if any) is erased
+entirely, and it's removed from the Forbidden list if it was on it. Asks
+for confirmation first, since this can't be undone. If the exact same
+identity connects again afterward, Patchbay treats it as a brand new
+agent it's never seen — including triggering the connect-approval prompt
+again, if that setting is on. Use this to clean up test agents or ones
+you no longer use, so they stop cluttering the Custom/Forbidden lists.
+
+UNDER THE HOOD
+---------------
+Patchbay is a small Rust program built on Tauri 2 for the tray icon and
+Windows integration — there's no visible window, it's a background
+process with a menu. The gateway itself is implemented directly as a
+JSON-RPC/MCP server on axum and tokio, rather than delegated to a
+generic SDK, so Patchbay can control session tracking and live tool-list
+notifications directly (each connected agent gets its own tracked
+session and its own notification stream, so a tools-list change reaches
+every agent's live session correctly).
+
+Upstream servers are connected either as a local child process (stdio,
+for MCP servers you'd normally run via npx or a similar launcher) or as
+a remote HTTP endpoint (Streamable HTTP, for hosted MCP servers). A
+shared server process stays running as long as EITHER the global
+checkbox is on OR at least one agent's own Custom list wants it on — so
+turning a server off globally doesn't stop it for an agent who's
+specifically opted it back in via Custom permissions. Child processes
+are attached to a Windows Job Object so that quitting Patchbay or
+flipping a server off cannot leave orphaned processes behind — the OS
+guarantees the cleanup.
+
+Secrets — API keys, bearer tokens, anything sensitive in a server's
+config, including environment variables and HTTP authorization headers
+— are encrypted at rest using Windows' own DPAPI, tied to your Windows
+user account, the moment they're saved. There is no separate password or
+master key to manage.
+
+Config lives at %APPDATA%\Patchbay\patchbay.json. Logs (for
+troubleshooting) are at %APPDATA%\Patchbay\logs\. Patchbay binds
+strictly to 127.0.0.1 — it is never reachable from the network, only
+from this machine.

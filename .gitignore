@@ -1,0 +1,36 @@
+/src-tauri/target/
+/dist/
+/dist-exe/
+node_modules/
+
+# === Build logs (written by _build.ps1 / _test.ps1) ===
+/src-tauri/*.log
+/src-tauri/build_stage0.log
+
+# === AI agent context files — NEVER commit (SEC-6) ===
+AGENTS.md
+CLAUDE.md
+QWEN.md
+GEMINI.md
+.cursorrules
+.cursor/
+
+# === Kilo/Codex orchestration scratch files (prompts, logs, status trackers) — not project source ===
+_kilo_prompt_*.txt
+_kilo_*_out.log
+_status_kilo*.txt
+_codex_prompt_*.txt
+_codex_*.txt
+_codex_*.log
+_codex_*.md
+_selfcheck_*.log
+
+# === Internal planning + publication artifacts (not project source) ===
+_planning/
+_publication_report.md
+
+# === OS / editor cruft ===
+*.pdb
+.DS_Store
+Thumbs.db
+desktop.ini

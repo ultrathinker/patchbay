@@ -1,0 +1,46 @@
+// Patchbay configuration example
+// ===============================
+// This file DOCUMENTS every field. Patchbay never reads it. The real config is
+// `patchbay.json` (pure JSON, no comments) in the same folder. To change how
+// Patchbay behaves, edit `patchbay.json` by hand and then use the tray
+// "Reload config" item (or restart Patchbay) to apply it.
+//
+// Secrets
+// -------
+// Any `env` / `headers` value that does NOT start with "dpapi:" is treated as
+// PLAINTEXT and is automatically encrypted (rewritten as "dpapi:<base64>") the
+// next time Patchbay saves the config — for example when you toggle a jack in
+// the tray. So to add a secret, just type its plaintext value here and toggle a
+// jack once; it will be encrypted on disk afterwards. Only the same Windows
+// user can decrypt it (Windows DPAPI, CurrentUser scope).
+//
+// Names
+// -----
+// Jack names must match ^[A-Za-z0-9_-]+, contain NO "__", be at most 40 chars,
+// and be unique. Tools are exposed to agents as "<jack>__<tool>", which is why
+// "__" is reserved.
+{
+  "version": 1,                 // schema version
+  "port": 39100,                // gateway port, bound strictly to 127.0.0.1
+  "autostart": false,           // start Patchbay with Windows (HKCU Run)
+  "jacks": [
+    {
+      "name": "prod",           // [A-Za-z0-9_-]+, no "__", <= 40 chars, unique
+      "patched": false,         // ON (true) / OFF (false). prod ships OFF.
+      "transport": "stdio",     // "stdio" | "streamable-http"
+      "command": "npx",
+      "args": ["-y", "some-db-mcp"],
+      "env": { "DB_TOKEN": "type-a-plaintext-secret-here" },
+      "sharing": "shared",      // "shared" | "per_client_session"
+      "tools": null             // reserved for v0.2 (allow/deny tool lists)
+    },
+    {
+      "name": "docs",
+      "patched": true,
+      "transport": "streamable-http",
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer replace-me" }
+    }
+  ],
+  "bays": {}                    // reserved: presets (non-goal in v0.1)
+}
