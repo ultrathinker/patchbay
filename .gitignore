@@ -1,5 +1,4 @@
 /src-tauri/target/
-/dist/
 /dist-exe/
 node_modules/
 
