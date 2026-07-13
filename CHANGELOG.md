@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.11] — 2026-07-12
+
+### Fixed
+- Broadened the 1.2.8 stale-upstream-session auto-recovery beyond tabduct's
+  exact error signature: `is_session_invalid_body` only matched JSON-RPC error
+  code `-32000` or the text "initialize first"/"no valid". Live-diagnosed:
+  eUnifyMCP-Test uses a different code (`-32001`) and message ("Session not
+  found"), so it never auto-recovered — every call just failed until the jack
+  was manually toggled. Now matches any code in `-32000..=-32099` (the JSON-RPC
+  spec's reserved "Server error" range) combined with a message mentioning
+  "session", plus a widened text-only fallback ("not found"/"invalid"/
+  "expired", not just the original two phrasings).
+
 ## [1.2.10] — 2026-07-12
 
 ### Fixed
@@ -100,7 +113,8 @@ two-tier logging) and the subsequent security hardening.
   sensitive JSON keys inside logged request params (e.g. a jack's `headers`/`env`
   passed to `patchbay__add_jack`), which header redaction alone could not cover.
 
-[Unreleased]: https://github.com/ultrathinker/patchbay/compare/v1.2.10...HEAD
+[Unreleased]: https://github.com/ultrathinker/patchbay/compare/v1.2.11...HEAD
+[1.2.11]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.11
 [1.2.10]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.10
 [1.2.9]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.9
 [1.2.8]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.8
