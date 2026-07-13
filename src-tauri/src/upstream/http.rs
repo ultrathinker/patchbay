@@ -537,12 +537,44 @@ impl std::fmt::Display for ReqErr {
 /// `hosts/node/src/mcp-server.js` "No valid session; initialize first").
 fn is_session_invalid_body(text: &str) -> bool {
     if let Ok(v) = serde_json::from_str::<Value>(text) {
-        if v.get("error").and_then(|e| e.get("code")).and_then(|c| c.as_i64()) == Some(-32000) {
-            return true;
+        if let Some(code) = v.get("error").and_then(|e| e.get("code")).and_then(|c| c.as_i64()) {
+            // -32000..=-32099 is the JSON-RPC spec's reserved "Server error"
+            // range — different real MCP servers pick different codes within
+            // it for "your session is gone" (tabduct uses -32000; eUnifyMCP
+            // uses -32001; observed live, they disagree on the exact code).
+            // Combined with the message mentioning "session" so we don't
+            // accidentally treat every implementation-defined server error as
+            // a session issue (a code in this range with an unrelated message
+            // — e.g. a genuine internal error — must NOT trigger a
+            // reinitialize loop).
+            if (-32099..=-32000).contains(&code) {
+                let msg_lower = v
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if msg_lower.contains("session") {
+                    return true;
+                }
+            }
         }
     }
+    // Fallback for servers that don't reply with a byte-for-byte JSON-RPC
+    // error envelope (e.g. tabduct's mcp-server.js sends a plain-text body
+    // for this specific case): broadened beyond the original
+    // "initialize first"/"no valid" phrasing to also catch "session not
+    // found"/"session invalid"/"session expired" — the wording real servers
+    // actually use varies more than any fixed phrase list can fully cover, so
+    // this stays a best-effort net, not the primary signal (the JSON-RPC code
+    // check above is).
     let lower = text.to_ascii_lowercase();
-    lower.contains("session") && (lower.contains("initialize first") || lower.contains("no valid"))
+    lower.contains("session")
+        && (lower.contains("initialize first")
+            || lower.contains("no valid")
+            || lower.contains("not found")
+            || lower.contains("invalid")
+            || lower.contains("expired"))
 }
 
 // ---- SSE parsing helpers ----------------------------------------------------
@@ -619,7 +651,29 @@ mod tests {
     }
 
     #[test]
+    fn is_session_invalid_body_matches_eunifymcp_dash32001() {
+        // eUnifyMCP-Test's exact observed error (live, 2026-07-12): a
+        // DIFFERENT code from tabduct's -32000, which the original
+        // hardcoded-to-32000 check missed entirely — this jack never
+        // auto-recovered until the check was widened to the whole
+        // -32000..=-32099 "Server error" range.
+        let body = r#"{"error":{"code":-32001,"message":"Session not found"},"id":"","jsonrpc":"2.0"}"#;
+        assert!(is_session_invalid_body(body));
+    }
+
+    #[test]
+    fn is_session_invalid_body_text_fallback_covers_more_phrasings() {
+        assert!(is_session_invalid_body("Session not found"));
+        assert!(is_session_invalid_body("session invalid"));
+        assert!(is_session_invalid_body("Your session has expired"));
+    }
+
+    #[test]
     fn is_session_invalid_body_rejects_unrelated_errors() {
+        // Reserved server-error-range code, but the message has nothing to do
+        // with sessions — must NOT trigger a reinitialize loop.
+        assert!(!is_session_invalid_body(r#"{"error":{"code":-32050,"message":"internal database error"}}"#));
+        // Outside the reserved server-error range entirely.
         assert!(!is_session_invalid_body(r#"{"error":{"code":-32602,"message":"invalid params"}}"#));
         assert!(!is_session_invalid_body("internal server error"));
         assert!(!is_session_invalid_body(""));
