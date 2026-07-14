@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.12] — 2026-07-12
+
+### Fixed
+- The 1.2.11 fix widened WHICH error bodies count as "session invalid", but
+  `send_once` only ever inspected the body when the upstream's HTTP status was
+  exactly `400 Bad Request` — so the whole auto-recovery path stayed
+  unreachable for any server that replies `404` instead (tabduct happens to
+  use 400; eUnifyMCP-Test/-Prod use 404, the code the MCP spec itself
+  recommends). Live-diagnosed: both eUnifyMCP jacks lost their upstream
+  session mid-run and never self-healed, surfacing a raw "upstream HTTP 404"
+  on every call. Broadened the status check from `== BAD_REQUEST` to
+  `status.is_client_error()` (the whole 4xx range) — verified live, both
+  jacks recovered immediately after the fix.
+
 ## [1.2.11] — 2026-07-12
 
 ### Fixed
@@ -113,7 +127,8 @@ two-tier logging) and the subsequent security hardening.
   sensitive JSON keys inside logged request params (e.g. a jack's `headers`/`env`
   passed to `patchbay__add_jack`), which header redaction alone could not cover.
 
-[Unreleased]: https://github.com/ultrathinker/patchbay/compare/v1.2.11...HEAD
+[Unreleased]: https://github.com/ultrathinker/patchbay/compare/v1.2.12...HEAD
+[1.2.12]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.12
 [1.2.11]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.11
 [1.2.10]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.10
 [1.2.9]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.9
