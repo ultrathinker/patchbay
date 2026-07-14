@@ -279,7 +279,20 @@ impl HttpClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::BAD_REQUEST && is_session_invalid_body(&text) {
+            // (Review fix, live-diagnosed) Different real MCP servers use
+            // different HTTP status codes for "your session is gone": tabduct
+            // replies 400, eUnifyMCP-Test/-Prod reply 404 (actually the MCP
+            // spec's own recommended code — see the gateway's OWN dead-session
+            // handling in gateway/http.rs). Gating on `== BAD_REQUEST` alone
+            // meant this whole auto-recovery path was UNREACHABLE for any
+            // server using 404, regardless of how well `is_session_invalid_body`
+            // matched the body — confirmed live: eUnifyMCP-Test/-Prod session
+            // loss surfaced as a raw "upstream HTTP 404" failure with zero
+            // auto-recovery, while tabduct (400) always self-healed. A
+            // session-invalid signal is inherently a client-facing error, so
+            // check the body across the WHOLE 4xx range rather than pin to one
+            // specific code.
+            if status.is_client_error() && is_session_invalid_body(&text) {
                 // Clear the now-dead id immediately (not just inside
                 // `do_initialize`): `reinitialize_then_retry`'s dedup guard
                 // checks `session_id.lock().is_none()` to decide whether a
