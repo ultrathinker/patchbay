@@ -357,8 +357,9 @@ impl SessionRegistry {
         }
     }
 
-    /// Mark a session as having completed initialization
-    /// (`notifications/initialized` received). No-op for an unknown id.
+    /// Test-only helper to flip a session's initialized flag. Production sets
+    /// the atomic directly in the `notifications/initialized` handler.
+    #[cfg(test)]
     pub fn mark_initialized(&self, id: &str) {
         if let Some(s) = self.get(id) {
             s.initialized.store(true, Ordering::Release);

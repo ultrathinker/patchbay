@@ -34,13 +34,13 @@ fn main() {
         default_hook(info);
     }));
 
-    log("main: Patchbay starting (stage 5 enforcement + tray toggles)");
+    log("main: Patchbay starting");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|_app, _args, _cwd| {
-            // No window in v0.1, so there is nothing to focus/show. A second
+            // No window (tray-only app), so there is nothing to focus/show. A second
             // launch just logs and no-ops.
-            log("single-instance: second launch ignored (no window in v0.1)");
+            log("single-instance: second launch ignored (tray-only, no window)");
         }))
         .setup(|app| {
             log("setup: begin");

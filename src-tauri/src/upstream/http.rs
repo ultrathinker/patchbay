@@ -543,11 +543,13 @@ impl std::fmt::Display for ReqErr {
     }
 }
 
-/// Is this HTTP 400 body the MCP "no/unknown session" error? Matched on the
+/// Is this response body the MCP "no/unknown session" error? Matched on the
 /// JSON-RPC error code the spec reserves for it (-32000) when parseable, with
 /// a substring fallback for servers that reply with a similar but not
 /// byte-for-byte-identical envelope (matches tabduct's
 /// `hosts/node/src/mcp-server.js` "No valid session; initialize first").
+/// Called for any 4xx response (see `send_once`), not just HTTP 400, since
+/// real servers disagree on the exact status code for an invalid session.
 fn is_session_invalid_body(text: &str) -> bool {
     if let Ok(v) = serde_json::from_str::<Value>(text) {
         if let Some(code) = v.get("error").and_then(|e| e.get("code")).and_then(|c| c.as_i64()) {

@@ -120,7 +120,6 @@ impl StdioClient {
         // Never flash a console window for the child.
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 

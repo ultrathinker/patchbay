@@ -365,22 +365,6 @@ impl JackTransport {
             _ => None,
         }
     }
-
-    /// Shared env map for stdio jacks (empty for http).
-    pub fn env(&self) -> Option<&BTreeMap<String, String>> {
-        match self {
-            JackTransport::Stdio { env, .. } => Some(env),
-            _ => None,
-        }
-    }
-
-    /// Shared headers map for streamable-http jacks (empty for stdio).
-    pub fn headers(&self) -> Option<&BTreeMap<String, String>> {
-        match self {
-            JackTransport::StreamableHttp { headers, .. } => Some(headers),
-            _ => None,
-        }
-    }
 }
 
 #[cfg(test)]

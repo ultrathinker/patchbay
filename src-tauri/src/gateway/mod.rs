@@ -13,7 +13,7 @@ pub mod tools;
 
 use std::net::SocketAddr;
 
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, post};
 use axum::Router;
 
 use crate::app_state::{AppState, GatewayStatus};

@@ -4,7 +4,7 @@ version = "1.2.12"
 description = "Patchbay - system-tray MCP gateway that toggles MCP servers for all CLI agents at once"
 authors = ["Patchbay"]
 license = "MIT"
-repository = "https://github.com/ultrathinker/Patchbay"
+repository = "https://github.com/ultrathinker/patchbay"
 edition = "2021"
 
 [build-dependencies]
