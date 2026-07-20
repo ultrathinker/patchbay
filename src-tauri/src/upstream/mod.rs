@@ -393,35 +393,6 @@ impl UpstreamManager {
         }
     }
 
-    /// Start every jack whose shared child SHOULD run (S10): the global
-    /// `patched` flag OR any enabled Custom client needing it. (Currently unused
-    /// — the boot path inlines this loop — but kept correct for future callers.)
-    pub async fn start_all_patched(
-        &self,
-        cfg: Arc<RwLock<PatchbayConfig>>,
-        sessions: Arc<SessionRegistry>,
-    ) {
-        let jacks: Vec<JackConfig> = cfg.read().jacks.clone();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for jack in &jacks {
-            // (S10) should_run_jack is the GLOBAL-OR-Custom aggregate; a jack
-            // OFF globally but ON for a Custom client still starts here.
-            if !cfg.read().should_run_jack(&jack.name) {
-                continue;
-            }
-            // (FIX 4) Skip duplicate names: keep the FIRST occurrence only.
-            if !seen.insert(jack.name.clone()) {
-                log(&format!(
-                    "upstream: skipping duplicate jack name '{}' (keeping first)",
-                    jack.name
-                ));
-                continue;
-            }
-            // S6: both transports start the same way.
-            self.start_jack(jack, sessions.clone(), cfg.clone()).await;
-        }
-    }
-
     /// Route a `tools/call` to a Running jack's child. Returns `Err(reason)` if
     /// the jack is unknown or not Running (the polished D2 taxonomy is S5; here
     /// the gateway maps the error to a simple JSON-RPC error).

@@ -3,7 +3,7 @@
 > One tray toggle for **all** your AI coding agents' MCP servers — at once, no
 > restarts.
 
-![CI](https://github.com/ultrathinker/Patchbay/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/ultrathinker/patchbay/actions/workflows/ci.yml/badge.svg)
 ![Rust](https://img.shields.io/badge/rust-stable-orange)
 ![Tauri](https://img.shields.io/badge/Tauri-v2-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
@@ -173,8 +173,7 @@ cargo tauri build
 ```
 
 Targets: release **binary < 12 MB**, **idle RAM < 40 MB** (currently ~3 MB
-binary / ~16 MB idle RAM). Bound strictly to `127.0.0.1`; no webview window in
-v0.1.
+binary / ~16 MB idle RAM). Bound strictly to `127.0.0.1`; no webview window.
 
 ## Architecture
 
