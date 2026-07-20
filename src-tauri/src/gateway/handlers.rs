@@ -1271,7 +1271,7 @@ mod tests {
     /// has an ENABLED override turning `prod` OFF (so effective_patched is false
     /// ONLY for codex). No upstream is ever started.
     fn state_with_codex_override_off() -> AppState {
-        use crate::config::{ClientOverride, PatchbayConfig};
+        use crate::config::ClientOverride;
         use std::collections::BTreeMap;
         let mut cfg = first_run_template();
         cfg.jacks[0].patched = true; // prod patched ON globally

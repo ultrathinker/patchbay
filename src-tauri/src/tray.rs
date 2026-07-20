@@ -76,7 +76,6 @@ pub struct ForbiddenItem {
 /// [`TrayItems::enable_custom`] lookup table.
 #[derive(Clone)]
 pub struct EnableCustomItem {
-    pub item: CheckMenuItem<Wry>,
     pub client: String,
 }
 
@@ -372,7 +371,6 @@ fn build_custom_submenu(app: &AppHandle, state: &AppState) -> Result<Submenu<Wry
                     items.enable_custom.lock().insert(
                         id,
                         EnableCustomItem {
-                            item: item.clone(),
                             client: client_name.clone(),
                         },
                     );

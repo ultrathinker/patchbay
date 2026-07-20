@@ -86,8 +86,7 @@ impl AppState {
         *self.tray_handle.write() = Some(handle);
     }
 
-    /// Snapshot of every jack for the tray menu + tooltip: name, patched flag,
-    /// and whether the upstream child is currently Running.
+    /// Snapshot of every jack for the tray menu + tooltip: name + patched flag.
     pub fn jack_lines(&self) -> Vec<JackLine> {
         let cfg = self.config.read();
         cfg.jacks
@@ -95,7 +94,6 @@ impl AppState {
             .map(|j| JackLine {
                 name: j.name.clone(),
                 patched: j.patched,
-                running: self.upstream.is_jack_running(&j.name),
             })
             .collect()
     }
@@ -862,43 +860,11 @@ impl AppState {
         ));
     }
 
-    /// Remove an identity from `forbidden_clients` (S10c, tray "Forbidden (N)"
-    /// submenu). This does NOT retroactively grant `seen_clients` status: if the
-    /// agent reconnects after being un-forbidden, it goes through the approval
-    /// gate again as if new (unless the gate setting is OFF). Persists +
-    /// broadcasts a `tools/list_changed` (mostly cosmetic — enforcement reads
-    /// config fresh on every request — but consistent with the other toggle
-    /// paths).
-    pub async fn remove_forbidden_client(&self, identity: &str) -> Result<(), String> {
-        // Save-then-commit (same discipline as add_jack/remove_jack/set_forbidden):
-        // build the candidate from a READ, persist it, only THEN commit to the
-        // live config — a failed save can never leave memory and disk diverged.
-        let (candidate, removed) = {
-            let cfg = self.config.read();
-            let mut candidate = cfg.clone();
-            let before = candidate.forbidden_clients.len();
-            candidate.forbidden_clients.retain(|c| c != identity);
-            let removed = before != candidate.forbidden_clients.len();
-            (candidate, removed)
-        };
-        if removed {
-            if let Err(e) = config::save(&candidate) {
-                log(&format!("remove_forbidden_client: failed to persist: {}", e));
-                return Err(e);
-            }
-            *self.config.write() = candidate;
-            self.reconcile_all_jack_lifecycles().await;
-        } else {
-            self.sessions.broadcast_tools_list_changed().await;
-        }
-        Ok(())
-    }
 
     /// Toggle whether a client identity is forbidden (S11 tray "Forbidden"
     /// submenu redesign). `forbidden == true` appends the identity to
     /// `forbidden_clients` (idempotent); `forbidden == false` removes it
-    /// (idempotent) — superseding the one-way [`Self::remove_forbidden_client`]
-    /// with a symmetric toggle. Does NOT touch `seen_clients` in either
+    /// (idempotent), a symmetric toggle. Does NOT touch `seen_clients` in either
     /// direction (an identity toggled here was necessarily already seen to
     /// appear in the list at all). Persists via the save-then-commit discipline
     /// (read → mutate a snapshot → `config::save` → commit to live config) used
@@ -1139,12 +1105,11 @@ pub struct ToggleResult {
     pub status: String,
 }
 
-/// One row of the tray's per-jack view (name / patched / running).
+/// One row of the tray's per-jack view (name / patched).
 #[derive(Clone, Debug)]
 pub struct JackLine {
     pub name: String,
     pub patched: bool,
-    pub running: bool,
 }
 
 // ---- S8: add/remove/list jack support types ------------------------------
@@ -1673,7 +1638,7 @@ mod tests {
         isolate_config();
         let st = state_two_jacks();
         st.config.write().forbidden_clients.push("banned".to_string());
-        st.remove_forbidden_client("banned").await.unwrap();
+        st.set_forbidden("banned", false).await.unwrap();
         assert!(!st.config.read().is_forbidden(Some("banned")));
         // Un-forbidding does NOT retroactively mark the client as seen: a
         // reconnect goes through the gate again (unless the gate is off).

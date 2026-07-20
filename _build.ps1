@@ -11,7 +11,7 @@ $vcvars = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Aux
 cmd /c "`"$vcvars`" >nul 2>&1 && set" | ForEach-Object {
   if ($_ -match '^([^=]+)=(.*)$') { Set-Item "Env:\$($matches[1])" $matches[2] }
 }
-Set-Location "C:\VS_PROJECTS\_NonWork\Patchbay\src-tauri"
+Set-Location (Join-Path $PSScriptRoot "src-tauri")
 if ($Release) { cmd /c "cargo build --release > build.log 2>&1" }
 else          { cmd /c "cargo build > build.log 2>&1" }
 "CARGO_EXIT: $LASTEXITCODE" | Out-File -Append -Encoding utf8 build.log
