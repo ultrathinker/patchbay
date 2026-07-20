@@ -140,6 +140,10 @@ Inside "Settings":
     Opens the config file in a text editor, in case you want to add,
     remove, or tweak a server by hand.
 
+  Open logs folder
+    Opens the folder that holds Patchbay's log files, so you can inspect
+    or share them when diagnosing a problem.
+
   Copy gateway URL
     Puts Patchbay's address on your clipboard — paste it into any
     MCP-capable agent's settings to connect it through Patchbay.
@@ -150,6 +154,11 @@ Inside "Settings":
 
   Require approval for new agents
     See "Connect approval" above. Off by default.
+
+  Enable request logging (Settings submenu)
+    Toggles a second-tier log that records each MCP request and response
+    passing through the gateway, with secrets redacted. Off by default;
+    turn it on when you need to see exactly what an agent is calling.
 
 You can also just ask an AI agent already connected through Patchbay to
 manage Patchbay for you — "add this MCP server", "turn off the

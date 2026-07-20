@@ -131,6 +131,8 @@ Each jack's tools are exposed to agents as `<jack>__<tool>`
   since freed up).
 - **Reload config** — re-reads `patchbay.json` and reconciles jacks.
 - **Open config file** / **Copy gateway URL** — convenience helpers.
+- **Open logs folder** — opens the folder holding Patchbay's log files.
+- **Enable request logging** (in the Settings submenu) — toggles a second-tier log that records each MCP request/response with secrets redacted; off by default.
 - **Start with Windows** — toggles autostart.
 - **Quit**.
 
