@@ -292,7 +292,22 @@ impl HttpClient {
             // session-invalid signal is inherently a client-facing error, so
             // check the body across the WHOLE 4xx range rather than pin to one
             // specific code.
-            if status.is_client_error() && is_session_invalid_body(&text) {
+            //
+            // A bare 404 is trusted unconditionally, without inspecting the
+            // body at all: bee-memory-bank's upstream (Apache in front of it)
+            // answers a stale `Mcp-Session-Id` with a plain Apache "404 Not
+            // Found" HTML page — no JSON, no mention of "session" anywhere —
+            // so `is_session_invalid_body` can never match it (live-diagnosed:
+            // confirmed the exact same Apache page comes back for a
+            // deliberately-wrong session id, and a fresh session gets 200).
+            // 404 is the MCP spec's own recommended "session not found" code,
+            // so treating it as always-worth-a-reinit-retry is the
+            // spec-aligned default; any other 4xx still needs
+            // `is_session_invalid_body` to opt in, since 400/403/etc. are used
+            // by real servers for plenty of unrelated errors.
+            if status == reqwest::StatusCode::NOT_FOUND
+                || (status.is_client_error() && is_session_invalid_body(&text))
+            {
                 // Clear the now-dead id immediately (not just inside
                 // `do_initialize`): `reinitialize_then_retry`'s dedup guard
                 // checks `session_id.lock().is_none()` to decide whether a
@@ -692,6 +707,16 @@ mod tests {
         assert!(!is_session_invalid_body(r#"{"error":{"code":-32602,"message":"invalid params"}}"#));
         assert!(!is_session_invalid_body("internal server error"));
         assert!(!is_session_invalid_body(""));
+    }
+
+    #[test]
+    fn is_session_invalid_body_rejects_bare_apache_404_page() {
+        // bee-memory-bank's upstream (Apache) answers a stale session with a
+        // plain "Not Found" HTML page — no JSON, no "session" text anywhere.
+        // This must NOT match the body check; the bare-404 status check in
+        // `send_once` (not this function) is what catches this case instead.
+        let body = "<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n<html><head>\n<title>404 Not Found</title>\n</head><body>\n<h1>Not Found</h1>\n<p>The requested URL was not found on this server.</p>\n</body></html>\n";
+        assert!(!is_session_invalid_body(body));
     }
 
     #[test]
