@@ -48,7 +48,7 @@ log = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 # DPAPI (secrets) + Job Objects (zero-orphan child kill, used from S4).
-windows = { version = "0.58", features = [
+windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
     "Win32_System_JobObjects",
