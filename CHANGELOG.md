@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.13] — 2026-08-06
+
+### Fixed
+- The 1.2.12 fix widened the status-code gate to the whole 4xx range, but
+  still required `is_session_invalid_body` to match the response body before
+  treating a 4xx as recoverable. Live-diagnosed: bee-memory-bank's upstream
+  (Apache) answers a stale `Mcp-Session-Id` with a bare "404 Not Found" HTML
+  page — no JSON, no mention of "session" anywhere — so the body check could
+  never match it, and every call failed with a raw "upstream HTTP 404"
+  forever. Since HTTP 404 is the MCP spec's own recommended code for "session
+  not found" (already the exact signal used by eUnifyMCP-Test/-Prod), a bare
+  404 is now trusted unconditionally, with no body inspection required — any
+  other 4xx still needs `is_session_invalid_body` to opt in. Verified live:
+  bee-memory-bank recovered immediately after the fix.
+
 ## [1.2.12] — 2026-07-12
 
 ### Fixed
@@ -127,7 +142,8 @@ two-tier logging) and the subsequent security hardening.
   sensitive JSON keys inside logged request params (e.g. a jack's `headers`/`env`
   passed to `patchbay__add_jack`), which header redaction alone could not cover.
 
-[Unreleased]: https://github.com/ultrathinker/patchbay/compare/v1.2.12...HEAD
+[Unreleased]: https://github.com/ultrathinker/patchbay/compare/v1.2.13...HEAD
+[1.2.13]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.13
 [1.2.12]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.12
 [1.2.11]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.11
 [1.2.10]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.10
