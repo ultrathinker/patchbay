@@ -19,8 +19,8 @@ serde_json = "1.0"
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "net", "signal"] }
 base64 = "0.22"
 chrono = "0.4"
-winreg = "0.52"
-dirs = "5.0"
+winreg = "0.55"
+dirs = "6.0"
 # Non-poisoning sync locks: a panic while holding the guard won't poison the
 # lock, so one bug can't cascade into every later .lock() panicking.
 parking_lot = "0.12"
@@ -48,7 +48,7 @@ log = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 # DPAPI (secrets) + Job Objects (zero-orphan child kill, used from S4).
-windows = { version = "0.58", features = [
+windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
     "Win32_System_JobObjects",
