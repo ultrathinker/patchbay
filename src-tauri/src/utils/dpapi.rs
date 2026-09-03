@@ -16,7 +16,7 @@ use windows::Win32::Security::Cryptography::{
 /// CryptProtectData/CryptUnprotectData output blob (3.21).
 unsafe fn free_dpapi_blob(ptr: *mut u8) {
     if !ptr.is_null() {
-        let _ = LocalFree(HLOCAL(ptr as *mut _));
+        let _ = LocalFree(Some(HLOCAL(ptr as *mut _)));
     }
 }
 

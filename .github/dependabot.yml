@@ -6,6 +6,41 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    # Tauri's LINUX backend (GTK/WebKitGTK) is in Cargo.lock because Cargo
+    # records every platform, but Patchbay is Windows-only: none of these
+    # crates is ever compiled into the shipped binary. Their versions are
+    # pinned by `tauri` -> `gtk` 0.18 anyway, so a bump here cannot be merged
+    # without Tauri itself moving first. Ignoring them stops a stream of PRs
+    # and advisories about code this project does not build.
+    ignore:
+      - dependency-name: "glib"
+      - dependency-name: "glib-sys"
+      - dependency-name: "glib-macros"
+      - dependency-name: "gtk"
+      - dependency-name: "gtk-sys"
+      - dependency-name: "gdk"
+      - dependency-name: "gdk-sys"
+      - dependency-name: "gdkx11"
+      - dependency-name: "gdkx11-sys"
+      - dependency-name: "gdk-pixbuf"
+      - dependency-name: "gdk-pixbuf-sys"
+      - dependency-name: "gio"
+      - dependency-name: "gio-sys"
+      - dependency-name: "gobject-sys"
+      - dependency-name: "atk"
+      - dependency-name: "atk-sys"
+      - dependency-name: "cairo-rs"
+      - dependency-name: "cairo-sys-rs"
+      - dependency-name: "pango"
+      - dependency-name: "pango-sys"
+      - dependency-name: "soup3"
+      - dependency-name: "soup3-sys"
+      - dependency-name: "webkit2gtk"
+      - dependency-name: "webkit2gtk-sys"
+      - dependency-name: "javascriptcore-rs"
+      - dependency-name: "javascriptcore-rs-sys"
+      - dependency-name: "libappindicator"
+      - dependency-name: "libappindicator-sys"
 
   # GitHub Actions used in workflows
   - package-ecosystem: "github-actions"

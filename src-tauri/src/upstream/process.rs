@@ -10,7 +10,7 @@
 
 #[cfg(windows)]
 mod imp {
-    use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -77,10 +77,10 @@ mod imp {
             // closed before return.
             unsafe {
                 let access = PROCESS_ACCESS_RIGHTS(PROCESS_SET_QUOTA.0 | PROCESS_TERMINATE.0);
-                // BOOL(0) == FALSE for bInheritHandle (we never inherit this
-                // handle into children). Explicit BOOL avoids relying on the
-                // `bool: Param<BOOL>` conversion.
-                let proc_handle = match OpenProcess(access, BOOL(0), pid) {
+                // bInheritHandle = false: we never inherit this handle into
+                // children. (windows 0.61 takes a plain `bool` here; the
+                // `BOOL` newtype this used to pass no longer exists.)
+                let proc_handle = match OpenProcess(access, false, pid) {
                     Ok(h) => h,
                     Err(e) => {
                         log(&format!("process: OpenProcess({}) failed: {}", pid, e));
