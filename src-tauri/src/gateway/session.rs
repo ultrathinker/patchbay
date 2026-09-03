@@ -248,6 +248,17 @@ impl ClientSession {
     }
 }
 
+/// One live session, flattened for the UI (S13). See
+/// [`SessionRegistry::snapshot`].
+#[derive(Clone, Debug)]
+pub struct LiveSession {
+    /// The resolved client identity, or `None` for a session that initialized
+    /// without identifying itself.
+    pub client_name: Option<String>,
+    /// How long since this session last did anything.
+    pub idle: Duration,
+}
+
 /// Process-wide registry of live client sessions.
 pub struct SessionRegistry {
     sessions: RwLock<HashMap<SessionId, Arc<ClientSession>>>,
@@ -286,6 +297,37 @@ impl SessionRegistry {
             .write()
             .insert(session.id.clone(), session.clone());
         session
+    }
+
+    /// (S13) One row per LIVE, initialized session: the client's identity and
+    /// how long ago it was last active.
+    ///
+    /// Added for the window UI's Agents screen, which has to answer a question
+    /// the config file cannot: *which of these identities is connected right
+    /// now?* `seen_clients` is durable but says nothing about the present, and
+    /// this registry is the only thing that knows.
+    ///
+    /// Deliberately returns owned, plain data rather than `Arc<ClientSession>`
+    /// handles: the caller is a UI snapshot builder that must not be able to
+    /// touch session internals, and holding the registry lock while a snapshot
+    /// is serialized would put the UI on the gateway's critical path.
+    ///
+    /// Sessions that never completed `initialize` are skipped — a half-open TCP
+    /// connection is not an agent, and showing it as one would be a lie the user
+    /// cannot act on. Several sessions may share one name (an agent that
+    /// reconnected without closing the old session); de-duplication is the
+    /// caller's business, since only it knows how it wants to present that.
+    pub fn snapshot(&self) -> Vec<LiveSession> {
+        let sessions = self.sessions.read();
+        let now = Instant::now();
+        sessions
+            .values()
+            .filter(|s| s.is_initialized())
+            .map(|s| LiveSession {
+                client_name: s.client_name.read().clone(),
+                idle: now.saturating_duration_since(s.inner.lock().last_seen),
+            })
+            .collect()
     }
 
     /// Look up a live session by id (clones the `Arc`).

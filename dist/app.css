@@ -1,0 +1,684 @@
+/* Patchbay popover — visual language (WINDOW_UI_PLAN.md §5).
+ *
+ * One token set, two themes. Every colour is defined once on :root and only
+ * re-bound under prefers-color-scheme, so no rule can be light-only by
+ * accident. Row heights are FIXED constants: an inbound state event must never
+ * be able to shift the layout under the user's cursor (§4.2), and "no layout
+ * shift" is only testable if the heights are not content-derived.
+ */
+
+:root {
+  --bg: #f3f3f3;
+  --card: #ffffff;
+  --card-hover: #f7f7f7;
+  --text: #1a1a1a;
+  --text-dim: #5d5d5d;
+  --stroke: #e0e0e0;
+  /* 3:1 against --card, per WCAG 1.4.11: this is the visible boundary of a
+     text input and a secondary button, not decoration. The original #c8c8c8
+     measured 1.67 and was effectively invisible on white. */
+  --stroke-strong: #8a8a8a;
+  --accent: #0067c0;
+  --accent-text: #ffffff;
+  --ok: #107c10;
+  /* Knob/label colour ON the green fill — the green differs per theme, so the
+     thing sitting on it has to as well. */
+  --ok-text: #ffffff;
+  --warn: #9d5d00;
+  --err: #c42b1c;
+  --err-bg: #fdf3f2;
+  --switch-off: #868686;
+  --shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+
+  --radius: 6px;
+  --row-h: 44px;
+  --header-h: 56px;
+  --footer-h: 40px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #202020;
+    --card: #2b2b2b;
+    --card-hover: #333333;
+    --text: #f2f2f2;
+    --text-dim: #a0a0a0;
+    --stroke: #3a3a3a;
+    /* Same rule in dark: #4a4a4a measured 1.60 against --card. */
+    --stroke-strong: #7a7a7a;
+    --accent: #4cc2ff;
+    --accent-text: #00243d;
+    --ok: #6ccb5f;
+    --ok-text: #08260a;
+    --warn: #fce100;
+    --err: #ff99a4;
+    --err-bg: #442726;
+    --switch-off: #9a9a9a;
+    --shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 1.4;
+  /* The popover is a flyout, not a document: nothing here is selectable text
+     the user would want to drag over, and a stray selection while clicking
+     switches looks broken. */
+  user-select: none;
+  cursor: default;
+}
+
+#root,
+.app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ---- focus -------------------------------------------------------------- */
+
+:focus {
+  outline: none;
+}
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  border-radius: var(--radius);
+}
+
+/* ---- header ------------------------------------------------------------- */
+
+.header {
+  flex: 0 0 auto;
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid var(--stroke);
+}
+
+.header-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.title {
+  font-family: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+  font-weight: 600;
+  font-size: 14px;
+  flex: 1 1 auto;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--switch-off);
+}
+.dot.running {
+  background: var(--ok);
+}
+.dot.starting {
+  background: var(--warn);
+}
+.dot.failed {
+  background: var(--err);
+}
+
+.url {
+  font-size: 11px;
+  color: var(--text-dim);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  padding: 2px 6px;
+  font-family: inherit;
+  cursor: pointer;
+}
+.url:hover {
+  border-color: var(--stroke-strong);
+  color: var(--text);
+}
+
+.subtitle {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 2px;
+  min-height: 15px; /* reserved so a status change cannot shift the list */
+}
+
+.banner {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  background: var(--err-bg);
+  color: var(--text);
+  border: 1px solid var(--err);
+  font-size: 12px;
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+.banner .banner-text {
+  flex: 1 1 auto;
+  user-select: text;
+}
+
+/* ---- section bar (title + actions) -------------------------------------- */
+
+.section {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px 6px;
+}
+.section h2 {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  flex: 1 1 auto;
+}
+
+.search {
+  flex: 0 0 auto;
+  width: 130px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--card);
+  border: 1px solid var(--stroke-strong);
+  border-radius: var(--radius);
+  padding: 3px 8px;
+  user-select: text;
+}
+.search::placeholder {
+  color: var(--text-dim);
+}
+
+/* ---- list --------------------------------------------------------------- */
+
+.list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 0 12px 8px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--row-h);
+  padding-top: 4px;
+  padding-bottom: 4px;
+  padding: 0 10px;
+  background: var(--card);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius);
+  margin-bottom: 6px;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+.row:hover {
+  background: var(--card-hover);
+}
+.row[aria-disabled="true"] {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.row-body {
+  /* Block formatting: these are <span> elements, so without this the name and
+     the meta line flow as one inline paragraph and spill over the badges on
+     the right. `min-width: 0` is what actually lets the ellipsis work inside a
+     flex item. */
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 1px;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.row-name {
+  display: block;
+  font-size: 13px;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.row-meta {
+  display: block;
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.row-meta.err {
+  color: var(--err);
+}
+
+/* Pending: shown ONLY after 150 ms (§4.1) — below that a spinner is noise. */
+.row--pending .row-meta {
+  animation: pulse 1s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.badge {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.chip {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--stroke-strong);
+  color: var(--text-dim);
+}
+
+/* ---- switch ------------------------------------------------------------- */
+
+.switch {
+  flex: 0 0 auto;
+  width: 36px;
+  height: 20px;
+  border-radius: 999px;
+  border: 1px solid var(--switch-off);
+  background: transparent;
+  padding: 0;
+  position: relative;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--switch-off);
+  /* An explicit, symmetric transition: a failed toggle animates BACK over the
+     same 120 ms, however long the backend took to refuse it (§4.1). */
+  transition: transform 120ms ease, background 120ms ease;
+}
+.switch[aria-checked="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.switch[aria-checked="true"]::after {
+  transform: translateX(16px);
+  background: var(--accent-text);
+}
+
+/* ---- inline confirm ----------------------------------------------------- */
+
+.confirm {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--row-h);
+  padding: 0 10px;
+  margin-bottom: 6px;
+  border: 1px solid var(--warn);
+  border-radius: var(--radius);
+  background: var(--card);
+}
+.confirm-text {
+  flex: 1 1 auto;
+  font-size: 12px;
+}
+
+/* ---- buttons ------------------------------------------------------------ */
+
+.btn {
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--card);
+  border: 1px solid var(--stroke-strong);
+  border-radius: var(--radius);
+  padding: 3px 10px;
+  cursor: pointer;
+}
+.btn:hover {
+  background: var(--card-hover);
+}
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+}
+.btn.icon {
+  padding: 3px 8px;
+}
+
+/* ---- footer ------------------------------------------------------------- */
+
+.footer {
+  flex: 0 0 auto;
+  height: var(--footer-h);
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 8px;
+  border-top: 1px solid var(--stroke);
+}
+
+.footer .spacer {
+  flex: 1 1 auto;
+}
+
+.link {
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.link:hover {
+  color: var(--text);
+  background: var(--card-hover);
+}
+.link[aria-current="true"] {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* ---- empty state -------------------------------------------------------- */
+
+.empty {
+  padding: 24px 16px;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.empty p {
+  margin: 0 0 12px;
+}
+
+/* ---- motion ------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::after,
+  *::before {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* ---- filter chips ------------------------------------------------------- */
+
+.chips {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 6px;
+  padding: 0 12px 8px;
+  flex-wrap: wrap;
+}
+
+.chip-btn {
+  font: inherit;
+  font-size: 11px;
+  background: var(--card);
+  cursor: pointer;
+  padding: 2px 10px;
+}
+.chip-btn:hover {
+  background: var(--card-hover);
+}
+.chip-btn.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+}
+
+/* ---- radio (interface picker) ------------------------------------------- */
+
+.radio {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid var(--switch-off);
+  position: relative;
+}
+.radio.on {
+  border-color: var(--accent);
+}
+.radio.on::after {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+/* ---- detail ------------------------------------------------------------- */
+
+.detail-head {
+  padding: 4px 2px 10px;
+}
+
+/* ---- forms -------------------------------------------------------------- */
+
+.form {
+  padding-bottom: 12px;
+}
+
+.field {
+  display: block;
+  margin-bottom: 12px;
+}
+
+.field-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+
+.field-hint {
+  display: block;
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 3px;
+}
+.field-hint.err {
+  color: var(--err);
+}
+
+.input {
+  width: 100%;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--card);
+  border: 1px solid var(--stroke-strong);
+  border-radius: var(--radius);
+  padding: 5px 8px;
+  user-select: text;
+}
+
+.pair {
+  display: flex;
+  gap: 6px;
+}
+.pair .input {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.segmented {
+  display: flex;
+  gap: 6px;
+}
+
+.form-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+/* ---- action + undo bars ------------------------------------------------- */
+
+.actionbar,
+.undobar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--stroke);
+  background: var(--card);
+}
+
+.actionbar .spacer,
+.undobar .spacer {
+  flex: 1 1 auto;
+}
+
+/* Destructive actions read as destructive — but only by BORDER and TEXT, never
+   by fill: a solid red button next to a solid accent button is the classic way
+   to get an accidental click. */
+.btn.danger {
+  color: var(--err);
+  border-color: var(--err);
+}
+.btn.danger:hover {
+  background: var(--err-bg);
+}
+
+.btn[disabled] {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* Secondary action inside a row (remove a server). Visible only on hover or
+   keyboard focus: it is a rare, destructive action sitting on a row whose main
+   job is a toggle, and a permanently visible ✕ next to every switch invites the
+   exact misclick it must not get. */
+.rowaction {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  line-height: 20px;
+  text-align: center;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  color: var(--text-dim);
+  font-size: 11px;
+  opacity: 0;
+  cursor: pointer;
+}
+.row:hover .rowaction,
+.rowaction:focus-visible {
+  opacity: 1;
+}
+.rowaction:hover {
+  color: var(--err);
+  border-color: var(--err);
+}
+
+/* ---- master row + its switch --------------------------------------------
+ *
+ * "Custom permissions" governs the list beneath it, so it must not read as a
+ * member of that list. Two changes carry that: it is lifted out of the flow
+ * (heavier border, its own breathing room, a caption underneath introducing the
+ * list it controls), and its switch is a different COLOUR rather than a
+ * brighter one — green for "this agent has its own rules", accent-blue for the
+ * ordinary per-server switches. Colour alone never carries meaning here: the
+ * position, the border and the caption all say the same thing.
+ */
+
+.row--master {
+  border-color: var(--ok);
+  border-width: 1px;
+  box-shadow: inset 3px 0 0 0 var(--ok);
+  padding-left: 12px;
+  margin-bottom: 4px;
+}
+.row--master .row-name {
+  font-weight: 600;
+}
+
+.switch--master[aria-checked="true"] {
+  background: var(--ok);
+  border-color: var(--ok);
+}
+.switch--master[aria-checked="true"]::after {
+  background: var(--ok-text);
+}
+
+/* Caption introducing the per-server list, so the rows below are visibly
+   subordinate to the master switch rather than its siblings. */
+.subhead {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 10px 2px 6px;
+}
+
+/* The delete action lives on the master row now, at the far right. Unlike the
+   remove-server ✕ it is always visible: an agent screen is somewhere you go
+   deliberately, and hiding the only destructive action behind a hover would
+   make it undiscoverable. */
+.rowaction--danger {
+  opacity: 1;
+  color: var(--text-dim);
+  border-color: var(--stroke-strong);
+}
+.rowaction--danger:hover {
+  color: var(--err);
+  border-color: var(--err);
+  background: var(--err-bg);
+}

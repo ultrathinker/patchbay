@@ -104,6 +104,7 @@ mod tests {
             version: 1,
             port: 39100,
             autostart: false,
+            ui_mode: crate::config::UiMode::Tray,
             jacks: vec![JackConfig {
                 name: "prod".to_string(),
                 patched: false,
@@ -189,6 +190,7 @@ mod tests {
             version: 1,
             port: 39100,
             autostart: false,
+            ui_mode: crate::config::UiMode::Tray,
             jacks: vec![JackConfig {
                 name: "docs".to_string(),
                 patched: true,

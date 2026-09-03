@@ -97,6 +97,20 @@ Directly below the jack list: "Settings" (everything below), then
 
 Inside "Settings":
 
+  Interface
+    Chooses which of Patchbay's two interfaces the tray icon drives:
+
+      Tray menu only (default)   left and right click both open this menu.
+      Window                     left click opens the popover window; right
+                                 click opens a small menu with just
+                                 "Show window", "Reload config" and "Quit",
+                                 so you are never stuck.
+      Both                       left click opens the window, right click
+                                 opens this full menu.
+
+    The default is the tray menu, so nothing changes until you choose
+    otherwise. See "THE WINDOW" below for what the window adds.
+
   Custom [<enabled>/<total>]
     A submenu listing every agent identity Patchbay has ever seen. Open
     any agent's name to see its own nested submenu:
@@ -169,6 +183,52 @@ patchbay__toggle_jack), which any connected agent calls the same way it
 calls any other tool. A newly added server's secrets get encrypted
 automatically, same as everything else.
 
+THE WINDOW
+-----------
+A Windows menu closes the instant you click anything in it. That is fine
+for one quick toggle you already know the position of, and poor for
+everything else: you cannot see whether the checkbox actually moved, a
+server that needs a second to start has nowhere to say "starting..." or
+"failed: connection refused", and flipping four servers means opening the
+menu four times.
+
+Turn it on in Settings > Interface. The window is a small panel that
+appears next to the tray icon and closes when you click away or press Esc.
+It has three screens:
+
+  Servers   One row per jack with a switch, the transport, the live tool
+            count, and any failure written on the row itself with a
+            "Retry" beside it. Turning on a production-class server asks
+            first, in the row, rather than in a system dialog.
+
+  Agents    Every identity that has ever connected, with a dot for the
+            ones connected right now and how long ago each was last
+            active. Filter by Connected, Custom, Denied or Unused — the
+            last meaning never seen since first contact, or quiet for 30
+            days, which is exactly the pile of one-off script identities
+            that accumulates. Select several and delete or deny them in
+            one go, with an Undo strip if you change your mind. Open one
+            agent to give it its own per-server permissions, or to hand it
+            back to the global list.
+
+  Settings  Interface, gateway port, start with Windows, the approval
+            gate, request logging, and the config and log folders.
+
+Both interfaces drive exactly the same state, so a change in one shows up
+in the other immediately, even with "Both" selected and the menu open.
+
+The window is only created the first time you open it: if you stay on the
+tray menu, Patchbay never starts a browser engine at all. It needs the
+WebView2 runtime, which ships with Windows 11 and current Windows 10. If
+it cannot start, Patchbay writes the reason to its log and falls back to
+the tray menu for that session WITHOUT changing your setting.
+
+One safety note worth knowing: an agent chooses its own name, and nothing
+authenticates it. Patchbay cleans that name up before storing or showing
+it anywhere, because a name is text in a menu but would be markup in a
+window.
+
+
 DELETING AN AGENT
 -------------------
 "Delete this agent" (inside that agent's Custom submenu only) permanently
@@ -209,7 +269,17 @@ config, including environment variables and HTTP authorization headers
 user account, the moment they're saved. There is no separate password or
 master key to manage.
 
-Config lives at %APPDATA%\Patchbay\patchbay.json. Logs (for
+Config lives at %APPDATA%\Patchbay\patchbay.json, with the previous
+version kept beside it as patchbay.json.bak. A second, throwaway file,
+patchbay.state.json, records which agents have connected and when — it
+holds nothing secret and you can delete it at any time; the only effect
+is that agents Patchbay already knew will look new again. Logs (for
 troubleshooting) are at %APPDATA%\Patchbay\logs\. Patchbay binds
 strictly to 127.0.0.1 — it is never reachable from the network, only
 from this machine.
+
+An agent can switch a server OFF for itself, but it cannot switch one
+ON. Only you can do that, from the tray icon or the Patchbay window.
+That holds however the agent asks — through Patchbay's own tools or
+through its local admin interface — so a coding agent can tidy up after
+itself without ever being able to reach for a server you had put away.

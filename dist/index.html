@@ -1,16 +1,24 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <title>Patchbay</title>
-  </head>
-  <body>
-    <!--
-      Patchbay is a tray-only app (app.windows = []). This stub only
-      exists to satisfy Tauri's frontendDist requirement; no webview is ever
-      shown.
-    -->
-    <h1>Patchbay</h1>
-    <p>This application runs in the system tray. There is no application window.</p>
-  </body>
+<head>
+  <meta charset="utf-8" />
+  <title>Patchbay</title>
+  <link rel="stylesheet" href="app.css" />
+</head>
+<body>
+  <!--
+    The popover shell (S13, WINDOW_UI_PLAN.md).
+
+    Everything below is rendered by app.js into #root. Vendored libraries are
+    loaded from this same origin — the strict CSP in tauri.conf.json
+    (script-src 'self') is deliberately unchanged, and nothing here needs a
+    dynamic-code relaxation of it. See vendor/PROVENANCE.txt.
+  -->
+  <div id="root"></div>
+
+  <script src="vendor/preact.umd.js"></script>
+  <script src="vendor/hooks.umd.js"></script>
+  <script src="vendor/htm.umd.js"></script>
+  <script src="app.js"></script>
+</body>
 </html>

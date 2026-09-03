@@ -6,8 +6,10 @@ mod approval;
 mod config;
 mod gateway;
 mod tray;
+mod ui;
 mod upstream;
 mod utils;
+mod window;
 
 use tauri::tray::TrayIconBuilder;
 use tauri::Manager; // brings `.manage()` into scope on App
@@ -37,6 +39,36 @@ fn main() {
     log("main: Patchbay starting");
 
     tauri::Builder::default()
+        // (S13) The popover window's IPC surface. Each command is a thin wrapper
+        // over ONE `AppState` method — the window is a second view, never a
+        // second model. Nothing else is exposed to the page.
+        .invoke_handler(tauri::generate_handler![
+            ui::ui_snapshot,
+            ui::ui_toggle_jack,
+            ui::ui_add_jack,
+            ui::ui_remove_jack,
+            ui::ui_set_client_override,
+            ui::ui_enable_custom,
+            ui::ui_disable_custom,
+            ui::ui_reset_custom_to_global,
+            ui::ui_set_forbidden,
+            ui::ui_set_forbidden_batch,
+            ui::ui_delete_agents,
+            ui::ui_undo,
+            ui::ui_set_autostart,
+            ui::ui_set_require_approval,
+            ui::ui_set_request_logging,
+            ui::ui_set_ui_mode,
+            ui::ui_reload_config,
+            ui::ui_retry_gateway,
+            ui::ui_open_config,
+            ui::ui_open_logs,
+            ui::ui_set_port,
+            ui::ui_copy_url,
+            ui::ui_about,
+            ui::ui_close_window,
+            ui::ui_quit,
+        ])
         .plugin(tauri_plugin_single_instance::init(|_app, _args, _cwd| {
             // No window (tray-only app), so there is nothing to focus/show. A second
             // launch just logs and no-ops.
@@ -97,6 +129,11 @@ fn main() {
             // The tray handle map must exist before build_menu populates it.
             app.manage(tray::TrayItems::default());
 
+            // (S13) Popover runtime state: the cached tray rect, the
+            // dismissed-by-tray-click flag and the creation-failed latch. Must
+            // exist before the first tray event can arrive.
+            app.manage(window::PopoverState::default());
+
             // Start the gateway OFF the setup thread so the tray stays
             // responsive from the first frame.
             let gw_state = app_state.clone();
@@ -116,7 +153,15 @@ fn main() {
                 .menu(&menu)
                 .show_menu_on_left_click(true)
                 .on_menu_event(tray::on_menu_event)
+                .on_tray_icon_event(tray::on_tray_icon_event)
                 .build(app)?;
+
+            // (S13 W-D1) Point the icon's buttons at whichever interface the
+            // config selects. Default `tray` reapplies exactly what the builder
+            // above already set, so an install that never opts in sees no
+            // change whatsoever.
+            let ui_mode = app_state.config.read().ui_mode;
+            tray::apply_ui_mode(&app.handle().clone(), ui_mode);
 
             // (S10) Inject the app handle into AppState so a background task
             // (recording a newly-seen MCP client from the gateway path) can
