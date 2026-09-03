@@ -7,6 +7,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.1] — 2026-09-03
+
+Five defects found by a full-application review, three of them reproducible on
+a real install: a config that could destroy itself, permission lists that failed
+open, and an admin surface any local process could use to switch a server back
+on.
+
+### Changed
+- **`patchbay.json` no longer holds the list of agents that have connected.**
+  That list is something Patchbay *observed*, not something the user
+  *configured*, and it was the one field rewritten by ordinary agent traffic —
+  an agent connecting appended to it, and `last_seen` was refreshed roughly once
+  a minute per active agent. Every one of those writes was a chance to lose the
+  whole configuration for a reason unrelated to configuration. It now lives in a
+  sibling `patchbay.state.json`, which holds nothing secret and is disposable:
+  delete it and previously-known agents simply look new. An existing install
+  migrates itself on load — the list is still read from the old file, and the
+  key disappears on the next save.
+- **Agents may switch a server off, never on.** `patchbay__toggle_jack`,
+  `patchbay__add_jack` and the identity-free `/admin/jacks*` REST routes let any
+  caller on `127.0.0.1` switch a server the user had switched off back on —
+  including a production database server — overriding the Custom lists, the
+  forbidden gate and the approval dialog alike. One rule now covers all four
+  entry points: nothing arriving over the gateway may make a server reachable
+  that was not reachable already. Switching off stays allowed (that is how an
+  agent drops a server it does not need); `add_jack` is allowed only with
+  `patched: false`, including when the field is omitted, since it defaults to
+  true. Refusals name the tray icon and the window so the model asks the user
+  instead of retrying, and the advertised tool schemas state the rule up front.
+  `remove_jack` is unchanged — it destroys a definition rather than granting
+  access, so it sits outside this rule.
+
+### Fixed
+- **A corrupt `patchbay.json` no longer destroys itself.** When the file failed
+  to parse at startup, Patchbay correctly kept an empty in-memory default and
+  refused to save it — but only in `main`. Every mutator still wrote, and the
+  mutators are not all user-initiated: one agent connecting reaches
+  `record_seen_client`, and `last_seen` is refreshed about once a minute per
+  active agent. So a config that failed to parse had roughly a minute to live
+  before the empty default was written over it, taking every server definition
+  and every DPAPI-encrypted secret with it. All writes now go through one
+  guarded helper that refuses while the parse error stands (the tray shows it;
+  "Reload config" clears it), and a source-level test keeps new mutators from
+  walking around the guard.
+- **Saving keeps one generation.** `patchbay.json` is rewritten by ordinary
+  background activity and had no backup at all; the previous file is now copied
+  to `patchbay.json.bak` before each atomic replace.
+
+### Security
+- **A Custom agent's permission list now fails closed.** `effective_patched`
+  fell back to the *global* flag for any server the agent's Custom list did not
+  name, so a gap in the list read as a grant — and a gap is exactly what drift
+  produces. Found on a real install, where three agents in Custom mode had
+  reachable access to a server nobody had granted them: their lists still named
+  two jacks from an older config and named the current one nowhere, so every
+  lookup missed and every miss was a grant. An enabled Custom list is now
+  exhaustive — a server it does not name is denied.
+- **Drifted permission maps are repaired on load.** Every loader now re-keys
+  each Custom list against the servers that actually exist: entries naming
+  servers that are gone are dropped, and servers the list never learned about
+  are added as OFF. Deliberately unlike adding a server by hand, which
+  propagates the value you chose: a repair of an unknown history must not hand
+  out access nobody granted. **On first start after upgrading, a Custom agent
+  may lose access to a server it had been reaching by accident; re-enable it on
+  that agent's screen if it was intended.**
+
+## [1.3.0] — 2026-09-03
+
+Stage S13, part 1 (W0): the groundwork for an optional window UI alongside the
+native tray menu. No user-visible interface change yet — `ui_mode` defaults to
+`tray`, which behaves exactly as before.
+
+### Added
+- **An optional popover window**, alongside the native tray menu and selected by
+  the new `ui_mode` setting (`tray` | `window` | `both`, default `tray` — an
+  existing install upgrades with no visible change). Three screens: servers with
+  live state and inline failures, agents with filters/multi-select/undo and
+  per-agent permissions, and settings. Created lazily, so `tray` users never
+  start a WebView2 process; if the webview cannot be created, Patchbay falls
+  back to the tray menu for that session without rewriting the setting.
+- **Settings → Interface** in the tray menu, so the window can be discovered and
+  enabled without hand-editing `patchbay.json`.
+- `ui_mode` config field. Parsed leniently: an absent, unknown or wrongly-typed
+  value degrades to `tray` with a log line instead of failing the whole config
+  parse.
+- `SeenClient.last_seen` — an RFC3339 timestamp refreshed on the `initialize`
+  path for clients that are already known, throttled to one persist per client
+  per 60 s. Until now nothing recorded that an identity was still in use, which
+  is what made long-dead one-shot script identities indistinguishable from the
+  agents actually in daily use. Absent on pre-1.3.0 configs (rendered as "never
+  seen since"); no backfill, because inventing activity that never happened
+  would defeat the point.
+
+### Security
+- Client identities (`clientInfo.name` and the `X-Patchbay-Client` header) are
+  now sanitized where they are resolved, before anything stores or displays
+  them. Neither is authenticated, and in the tray menu that was inert — Win32
+  treats a menu label as text. A webview does not: an identity containing markup
+  would have become script running inside the process that holds your MCP
+  credentials. Control characters are dropped (an embedded newline could forge a
+  log line) and other disallowed characters are replaced rather than deleted, so
+  tampering stays visible instead of turning `<script>` into `script`. The
+  frontend additionally uses no raw-HTML sink, the popover's Tauri capability
+  grants it only the event channel, and the strict CSP is unchanged — all four
+  checked by tests. See `docs/security.md`.
+- The window's state snapshot carries no secrets: no `env` values, no headers,
+  no URL credentials, not even encrypted ones. Secrets travel one way only, into
+  `add_jack`. A test asserts a known secret cannot appear in a serialized
+  snapshot.
+
+### Fixed
+- `set_patched` now follows the same save-then-commit discipline as every other
+  mutator. It used to write the new `patched` flag into the live config first
+  and merely log a failed `config::save`, so a failed persist left the running
+  process and the config file disagreeing — silently, on the most frequent
+  operation in the app. A failed save is now reported back to the caller
+  (`ToggleResult.status`) and nothing is committed.
+
 ## [1.2.13] — 2026-08-06
 
 ### Fixed

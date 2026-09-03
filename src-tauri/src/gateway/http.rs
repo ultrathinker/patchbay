@@ -412,6 +412,16 @@ pub async fn admin_add_jack(
     State(state): State<AppState>,
     Json(input): Json<crate::config::JackConfigInput>,
 ) -> Response {
+    // (S14) These routes carry NO identity — anything on loopback can call
+    // them — so the same rule applies here as to an agent's meta tool, and it
+    // matters more: there is not even a name to blame.
+    if let Err(refusal) = super::policy::check_add(&input.name, input.patched) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": refusal })),
+        )
+            .into_response();
+    }
     match state.add_jack(input).await {
         Ok(summary) => (StatusCode::CREATED, Json(summary)).into_response(),
         Err(e) => (
@@ -473,6 +483,14 @@ pub async fn admin_toggle_jack(
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": format!("jack '{}' not found", name) })),
+        )
+            .into_response();
+    }
+    // (S14) Off is allowed, on is the user's decision. See `gateway::policy`.
+    if let Err(refusal) = super::policy::check_enable(&name, body.patched) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": refusal })),
         )
             .into_response();
     }

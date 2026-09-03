@@ -6,8 +6,10 @@ document describes the stack, the module layout, and the key design decisions.
 ## Stack
 
 - **Rust** (edition 2021), stable toolchain.
-- **Tauri v2** — tray icon and Windows integration. No webview window
-  (`"windows": []` in `tauri.conf.json`).
+- **Tauri v2** — tray icon and Windows integration. No webview window is
+  created at startup (`"windows": []` in `tauri.conf.json`); since S13 an
+  OPTIONAL popover window is built lazily at runtime when `ui_mode` is
+  `window`/`both` (see `_planning/WINDOW_UI_PLAN.md`).
 - **axum + tokio** — the HTTP gateway and async runtime.
 - **parking_lot** — non-poisoning locks (a panic in one guard does not poison
   the lock for everyone else).
@@ -27,6 +29,7 @@ approval.rs             First-connection Allow/Deny gate (blocking Win32 dialog)
 config/
   mod.rs                Config load/save (save-then-commit discipline)
   schema.rs             patchbay.json schema (jacks, bays, seen_clients, overrides…)
+  policy.rs             what a gateway caller may change (S14: off yes, on no)
   secrets.rs            DPAPI encryption of env/headers; idempotent re-save
 
 gateway/
@@ -74,7 +77,9 @@ utils/
 
 | Path | Contents |
 |---|---|
-| `%APPDATA%\Patchbay\patchbay.json` | Config (jacks, port, autostart, seen agents, overrides, forbidden). Secrets stored DPAPI-encrypted (`dpapi:` prefix). |
+| `%APPDATA%\Patchbay\patchbay.json` | Config — what the **user** decided: jacks, port, autostart, per-agent overrides, forbidden agents. Secrets stored DPAPI-encrypted (`dpapi:` prefix). Written only when a setting changes. |
+| `%APPDATA%\Patchbay\patchbay.json.bak` | The previous generation, refreshed before every save (S14). |
+| `%APPDATA%\Patchbay\patchbay.state.json` | Runtime state — what Patchbay **observed**: which agents have connected, and when. Rewritten by ordinary agent traffic; disposable (delete it and known agents look new). Split out in S14 so that traffic stops rewriting the file holding the secrets. |
 | `%APPDATA%\Patchbay\patchbay.example.jsonc` | Fully-commented reference, written on first run. |
 | `%APPDATA%\Patchbay\logs\patchbay_r<N>.log` | Level-1 diagnostic log (rotated, ~5 generations). |
 | `%APPDATA%\Patchbay\logs\requests\<YYYY-MM-DD>.log` | Level-2 request/event log (opt-in). |

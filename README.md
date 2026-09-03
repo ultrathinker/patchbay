@@ -47,8 +47,9 @@ off in the Patchbay tray and every connected agent picks it up instantly.
   no master password, no plaintext on disk.
 - **Two-tier logging.** An always-on diagnostic log, plus an opt-in request/event
   log that records every MCP request and admin action with secrets redacted.
-- **Local only.** Bound strictly to `127.0.0.1`; no webview window, no network
-  exposure. Spawned child processes are tied to a Windows Job Object so quitting
+- **Local only.** Bound strictly to `127.0.0.1`; no network exposure. The
+  optional window UI (below) is a local webview that loads only embedded assets
+  under a strict CSP. Spawned child processes are tied to a Windows Job Object so quitting
   Patchbay can never leave orphans behind.
 
 > **Windows-only.** Patchbay uses Windows DPAPI, the registry (autostart), Job
@@ -121,6 +122,46 @@ After editing, click **Reload config** in the tray.
 Each jack's tools are exposed to agents as `<jack>__<tool>`
 (e.g. `github__create_issue`).
 
+## Two interfaces — pick one
+
+Since 1.3.0 Patchbay has **two** user interfaces over the same state, and a
+setting chooses which one the tray icon drives.
+
+| `ui_mode` | left-click the icon | right-click the icon |
+|---|---|---|
+| `tray` *(default)* | native menu | native menu |
+| `window` | popover window | small menu: Show window / Reload config / Quit |
+| `both` | popover window | native menu |
+
+Switch it in **Settings → Interface** (tray) or on the **Settings** screen
+(window). The default is `tray`, so upgrading changes nothing until you opt in.
+
+**Why a window exists.** A Windows menu closes the moment you click anything in
+it. That is fine for a single blind toggle you already know the position of, and
+poor for everything else: you cannot see whether a checkbox actually moved, a
+server that takes a second to start has nowhere to report "starting…" or
+"failed: connection refused", and flipping four servers means opening the menu
+four times. The popover stays open, shows live state, and supports selection —
+so deleting sixty accumulated agent identities is one filter, one select-all and
+one click instead of sixty menu traversals.
+
+**What the window shows.**
+
+- **Jacks** — one row per server with a real switch, its transport, its live
+  tool count, and any failure written on the row with a Retry next to it.
+  Turning on a production-class server asks first, inline in the row.
+- **Agents** — every identity that has connected, with a live dot for the ones
+  connected right now, filters (including **Unused**: never seen since first
+  contact, or quiet for 30 days), multi-select, and bulk delete or deny with an
+  undo strip. Open one to give it its own per-server permissions.
+- **Settings** — interface, gateway port, autostart, the approval gate, request
+  logging, and the config/log folders.
+
+The window is created the first time you open it, so `tray` users never pay for
+it. It needs the WebView2 runtime (present on Windows 11 and current Windows
+10); if it cannot start, Patchbay logs why and falls back to the tray menu for
+that session without changing your setting.
+
 ## Tray menu
 
 - One **checkable row per jack** — tick = patched (live), untick = unpatched
@@ -133,6 +174,8 @@ Each jack's tools are exposed to agents as `<jack>__<tool>`
 - **Open config file** / **Copy gateway URL** — convenience helpers.
 - **Open logs folder** — opens the folder holding Patchbay's log files.
 - **Enable request logging** (in the Settings submenu) — toggles a second-tier log that records each MCP request/response with secrets redacted; off by default.
+- **Interface** (in the Settings submenu) — chooses between the tray menu, the
+  popover window, or both. See above.
 - **Start with Windows** — toggles autostart.
 - **Quit**.
 
@@ -174,8 +217,10 @@ cargo build --release
 cargo tauri build
 ```
 
-Targets: release **binary < 12 MB**, **idle RAM < 40 MB** (currently ~3 MB
-binary / ~16 MB idle RAM). Bound strictly to `127.0.0.1`; no webview window.
+Targets: release **binary < 12 MB**, **idle RAM < 40 MB in tray mode**
+(currently ~3 MB binary / ~16 MB idle RAM). Window mode adds a WebView2 process
+once the popover has been opened at least once — the window is created lazily,
+so a user who stays in tray mode pays nothing. Bound strictly to `127.0.0.1`.
 
 ## Architecture
 
@@ -192,6 +237,7 @@ binary / ~16 MB idle RAM). Bound strictly to `127.0.0.1`; no webview window.
                                        ▼
                           toggle jacks / per-agent perms
                           config: %APPDATA%\Patchbay\patchbay.json
+                          state:  %APPDATA%\Patchbay\patchbay.state.json
 ```
 
 Patchbay speaks the [Model Context Protocol](https://modelcontextprotocol.io)

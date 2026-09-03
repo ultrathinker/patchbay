@@ -48,6 +48,12 @@ pub struct PatchbayConfig {
     #[serde(default)]
     pub autostart: bool,
 
+    /// Which user interface the tray icon drives (S13). `Tray` (the default)
+    /// keeps the pre-S13 behavior exactly: both mouse buttons open the native
+    /// Win32 menu. See [`UiMode`]. Unknown/absent values fall back to `Tray`.
+    #[serde(default)]
+    pub ui_mode: UiMode,
+
     /// The MCP servers Patchbay fronts. Order is preserved for tray display.
     #[serde(default)]
     pub jacks: Vec<JackConfig>,
@@ -60,7 +66,21 @@ pub struct PatchbayConfig {
     /// Append-only: a name already present is never duplicated or rewritten.
     /// (S10) Powers the tray "Custom" submenu so a newly-seen agent can be
     /// customized without a manual "Reload config".
-    #[serde(default)]
+    ///
+    /// **(S14) Observed, not configured — and therefore not stored in
+    /// `patchbay.json`.** This is the one field written by ordinary background
+    /// traffic: an agent connecting appends to it, and `last_seen` is refreshed
+    /// roughly once a minute per active agent. That made the file holding every
+    /// server definition and every DPAPI-encrypted secret write-hot for reasons
+    /// that have nothing to do with configuration — every one of those writes a
+    /// chance to lose the lot. It now lives in a sibling `patchbay.state.json`,
+    /// which is disposable: delete it and the only cost is that known agents
+    /// look new again.
+    ///
+    /// `skip_serializing` is what moves it: it is still READ from
+    /// `patchbay.json` (so an existing install migrates itself on load, and the
+    /// key disappears on the next save) but never written back there.
+    #[serde(default, skip_serializing)]
     pub seen_clients: Vec<SeenClient>,
 
     /// Per-client custom on/off lists (S10). Keyed by the RAW `clientInfo.name`
@@ -121,6 +141,112 @@ pub struct SeenClient {
     /// RFC3339 timestamp of the first sighting (display only).
     #[serde(default)]
     pub first_seen: String,
+
+    /// RFC3339 timestamp of the most recent sighting (S13), refreshed on the
+    /// `initialize` path and persisted at most once per client per
+    /// [`crate::app_state::LAST_SEEN_THROTTLE_SECS`] so a chatty agent cannot
+    /// turn the config file into a write-hot log.
+    ///
+    /// `None` on every pre-S13 config and on any client that has not connected
+    /// since this field was introduced — which the window UI renders as "never
+    /// seen since" and counts as unused. That is exactly right for the junk
+    /// class of one-shot script identities this field exists to identify, so no
+    /// migration/backfill is performed (backfilling from `first_seen` would
+    /// invent activity that never happened).
+    #[serde(default)]
+    pub last_seen: Option<String>,
+}
+
+/// Which user interface the tray icon drives (S13, `WINDOW_UI_PLAN.md` W-D1).
+///
+/// The popover window and the native menu are two views over the same
+/// `AppState`; this only decides which one a mouse button reaches.
+///
+/// | variant | left-click | right-click |
+/// |---|---|---|
+/// | [`UiMode::Tray`] (default) | native menu | native menu |
+/// | [`UiMode::Window`] | popover window | minimal native menu (escape hatch) |
+/// | [`UiMode::Both`] | popover window | full native menu |
+///
+/// `Tray` is the default so an existing install upgrades with ZERO behavior
+/// change and the window stays opt-in.
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UiMode {
+    /// Native Win32 menu on both buttons — the pre-S13 behavior.
+    #[default]
+    Tray,
+    /// Popover window on left-click; a minimal native menu on right-click.
+    Window,
+    /// Popover window on left-click; the full native menu on right-click.
+    Both,
+}
+
+impl UiMode {
+    /// Parse leniently: unknown or malformed values degrade to [`UiMode::Tray`]
+    /// rather than failing the whole config parse. Matches `main.rs`'s
+    /// never-overwrite-a-corrupt-config philosophy — a typo in one optional
+    /// field must not cost the user their jacks.
+    pub fn from_str_lenient(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "tray" => UiMode::Tray,
+            "window" => UiMode::Window,
+            "both" => UiMode::Both,
+            other => {
+                crate::utils::log::log(&format!(
+                    "config: unknown ui_mode '{}', falling back to 'tray'",
+                    other
+                ));
+                UiMode::Tray
+            }
+        }
+    }
+
+    /// The on-disk token, for logging and for round-tripping.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UiMode::Tray => "tray",
+            UiMode::Window => "window",
+            UiMode::Both => "both",
+        }
+    }
+
+    /// Does a LEFT click open the popover window (rather than the native menu)?
+    /// Drives `TrayIcon::set_show_menu_on_left_click` — see W-D1: with
+    /// `show_menu_on_left_click(true)` the Win32 shell runs `TrackPopupMenu`
+    /// synchronously and Tauri never gets to route the click to a window.
+    pub fn window_on_left_click(&self) -> bool {
+        matches!(self, UiMode::Window | UiMode::Both)
+    }
+
+    /// Does the RIGHT click get the FULL menu (vs. the minimal escape-hatch
+    /// menu of `Show window` / `Reload config` / `Quit`)?
+    pub fn full_menu(&self) -> bool {
+        matches!(self, UiMode::Tray | UiMode::Both)
+    }
+}
+
+impl<'de> Deserialize<'de> for UiMode {
+    /// Hand-written so an unknown STRING degrades to `Tray` (serde's `other`
+    /// attribute is only available on internally/adjacently tagged enums), and
+    /// so a wrong TYPE (`"ui_mode": 5`) degrades too instead of aborting the
+    /// parse of an otherwise-valid config.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value.as_str() {
+            Some(s) => Ok(UiMode::from_str_lenient(s)),
+            None => {
+                crate::utils::log::log(&format!(
+                    "config: ui_mode is not a string ({}), falling back to 'tray'",
+                    value
+                ));
+                Ok(UiMode::Tray)
+            }
+        }
+    }
 }
 
 /// One client's custom on/off list (S10). When `enabled`, the client uses
@@ -276,9 +402,21 @@ impl PatchbayConfig {
         if let Some(name) = client_name {
             if let Some(ovr) = self.client_overrides.get(name) {
                 if ovr.enabled {
-                    if let Some(&per_client) = ovr.jacks.get(jack_name) {
-                        return per_client;
-                    }
+                    // FAIL CLOSED. An enabled Custom override is a complete
+                    // statement of what this agent may reach: "exactly this
+                    // list". Falling back to the global flag for a jack the
+                    // list does not name turns a gap in the map into a GRANT,
+                    // and the gap is exactly what drift produces — a jack
+                    // renamed by hand, a config from an older version, a file
+                    // edited outside the app. That is how three agents on this
+                    // machine silently held access to a production server while
+                    // their Custom lists still named two jacks that no longer
+                    // existed. A missing entry is not a question; it is a no.
+                    //
+                    // `sync_override_jacks` repairs such maps on load, so this
+                    // branch should be unreachable in a healthy config. It is
+                    // the enforcement of last resort, not the normal path.
+                    return ovr.jacks.get(jack_name).copied().unwrap_or(false);
                 }
             }
         }
@@ -287,6 +425,38 @@ impl PatchbayConfig {
             .find(|j| j.name == jack_name)
             .map(|j| j.patched)
             .unwrap_or(false)
+    }
+
+    /// Repair every Custom override so its jack map names EXACTLY the jacks
+    /// that exist, returning the number of entries added or dropped.
+    ///
+    /// The app maintains this invariant as it goes (`add_jack` seeds the new
+    /// jack into every override, `remove_jack` drops it), but nothing enforced
+    /// it on the way IN. A config edited by hand, carried over from an older
+    /// version, or written by a jack rename drifts silently: the override map
+    /// keeps naming jacks that are gone and never learns about the ones that
+    /// arrived.
+    ///
+    /// A dropped key is pure garbage collection. An ADDED key is seeded `false`
+    /// — deliberately unlike `add_jack`, which propagates the global value.
+    /// `add_jack` is the user creating a jack right now with a stated intent
+    /// worth propagating; this is a repair of an unknown history, and a repair
+    /// must not hand out access nobody granted.
+    pub fn sync_override_jacks(&mut self) -> usize {
+        let names: Vec<String> = self.jacks.iter().map(|j| j.name.clone()).collect();
+        let mut repairs = 0usize;
+        for ovr in self.client_overrides.values_mut() {
+            let before = ovr.jacks.len();
+            ovr.jacks.retain(|jack, _| names.contains(jack));
+            repairs += before - ovr.jacks.len();
+            for name in &names {
+                if !ovr.jacks.contains_key(name) {
+                    ovr.jacks.insert(name.clone(), false);
+                    repairs += 1;
+                }
+            }
+        }
+        repairs
     }
 
     /// Whether a client identity has been DENIED at the first-connection gate
@@ -466,6 +636,7 @@ mod tests {
             version: 1,
             port: 1234,
             autostart: true,
+            ui_mode: crate::config::UiMode::Tray,
             jacks: vec![stdio_jack("a"), stdio_jack("b")],
             bays: BTreeMap::new(),
             seen_clients: Vec::new(),
@@ -500,6 +671,7 @@ mod tests {
             version: CURRENT_VERSION,
             port: DEFAULT_PORT,
             autostart: false,
+            ui_mode: crate::config::UiMode::Tray,
             jacks,
             bays: BTreeMap::new(),
             seen_clients: Vec::new(),
@@ -557,14 +729,68 @@ mod tests {
     }
 
     #[test]
-    fn effective_patched_override_missing_jack_falls_back_to_global() {
+    fn effective_patched_override_missing_jack_fails_closed() {
+        // This test previously asserted the OPPOSITE — that a missing entry
+        // fell back to the global flag. That is what let three agents on a real
+        // install reach a server nobody had granted them: their Custom lists
+        // still named two jacks from an earlier config and named the current
+        // one nowhere, so every lookup missed and every miss was a grant. An
+        // enabled Custom list is exhaustive; absence is denial.
         let mut cfg = cfg_with_jacks(vec![jack_named("alpha", true), jack_named("beta", true)]);
-        // Enabled override lists only alpha; beta entry is absent -> defensive
-        // fallback to global (true), NOT a default-deny.
         cfg.client_overrides
             .insert("codex".to_string(), make_override(true, &[("alpha", false)]));
         assert!(!cfg.effective_patched("alpha", Some("codex")));
-        assert!(cfg.effective_patched("beta", Some("codex")));
+        assert!(
+            !cfg.effective_patched("beta", Some("codex")),
+            "a jack the enabled Custom list does not name must be denied, not inherited"
+        );
+        // A DISABLED override still falls back to the global list: that agent
+        // has said it follows the global rules, so there is no list to be
+        // exhaustive about.
+        cfg.client_overrides
+            .insert("kilo".to_string(), make_override(false, &[("alpha", false)]));
+        assert!(cfg.effective_patched("beta", Some("kilo")));
+    }
+
+    #[test]
+    fn sync_override_jacks_drops_stale_and_seeds_missing_closed() {
+        let mut cfg = cfg_with_jacks(vec![jack_named("alpha", true), jack_named("beta", true)]);
+        // Exactly the drift found in the live config: the map names two jacks
+        // that no longer exist and does not name either that does.
+        cfg.client_overrides.insert(
+            "codex".to_string(),
+            make_override(true, &[("alpha-prod", true), ("alpha-test", false)]),
+        );
+
+        let repairs = cfg.sync_override_jacks();
+        assert_eq!(repairs, 4, "2 stale dropped + 2 missing seeded");
+
+        let ovr = &cfg.client_overrides["codex"];
+        assert_eq!(
+            ovr.jacks.keys().cloned().collect::<Vec<_>>(),
+            vec!["alpha".to_string(), "beta".to_string()],
+            "the map must name exactly the jacks that exist"
+        );
+        // Seeded CLOSED, unlike add_jack which propagates the global value: a
+        // repair of an unknown history must not hand out access nobody granted.
+        assert!(!ovr.jacks["alpha"]);
+        assert!(!ovr.jacks["beta"]);
+        // Idempotent — a healthy config is left alone.
+        assert_eq!(cfg.sync_override_jacks(), 0);
+    }
+
+    #[test]
+    fn sync_override_jacks_preserves_decisions_that_are_still_valid() {
+        let mut cfg = cfg_with_jacks(vec![jack_named("alpha", true), jack_named("beta", true)]);
+        cfg.client_overrides.insert(
+            "codex".to_string(),
+            make_override(true, &[("alpha", true), ("gone", true)]),
+        );
+        assert_eq!(cfg.sync_override_jacks(), 2);
+        // The user's actual choice about alpha survives; only the parts that
+        // cannot mean anything are touched.
+        assert!(cfg.client_overrides["codex"].jacks["alpha"]);
+        assert!(!cfg.client_overrides["codex"].jacks["beta"]);
     }
 
     #[test]
@@ -676,5 +902,136 @@ mod tests {
         assert!(!back.require_approval_for_new_clients);
         assert!(back.is_forbidden(Some("bad-agent")));
         assert!(!back.is_forbidden(Some("other")));
+    }
+
+    // ---- (S13) ui_mode + SeenClient::last_seen -----------------------------
+
+    #[test]
+    fn ui_mode_defaults_to_tray_when_absent() {
+        // A pre-S13 config file has no `ui_mode` key at all and must keep
+        // loading with the exact pre-S13 behavior.
+        let json = r#"{ "version": 1, "port": 39100, "jacks": [] }"#;
+        let cfg: PatchbayConfig = serde_json::from_str(json).expect("must parse");
+        assert_eq!(cfg.ui_mode, UiMode::Tray);
+    }
+
+    #[test]
+    fn ui_mode_parses_all_three_values() {
+        for (text, want) in [
+            ("tray", UiMode::Tray),
+            ("window", UiMode::Window),
+            ("both", UiMode::Both),
+        ] {
+            let json = format!(r#"{{ "ui_mode": "{}" }}"#, text);
+            let cfg: PatchbayConfig = serde_json::from_str(&json).expect("must parse");
+            assert_eq!(cfg.ui_mode, want, "ui_mode '{}'", text);
+        }
+    }
+
+    #[test]
+    fn ui_mode_is_case_and_whitespace_tolerant() {
+        let cfg: PatchbayConfig =
+            serde_json::from_str(r#"{ "ui_mode": "  Window " }"#).expect("must parse");
+        assert_eq!(cfg.ui_mode, UiMode::Window);
+    }
+
+    #[test]
+    fn ui_mode_unknown_value_degrades_to_tray_without_failing_the_parse() {
+        // The whole point: one typo in an optional cosmetic field must never
+        // cost the user their jacks (main.rs never overwrites a config it could
+        // not parse, so a hard error here would strand them).
+        let json = r#"{ "ui_mode": "windwo", "port": 40000 }"#;
+        let cfg: PatchbayConfig = serde_json::from_str(json).expect("must still parse");
+        assert_eq!(cfg.ui_mode, UiMode::Tray);
+        assert_eq!(cfg.port, 40000, "the rest of the config must survive");
+    }
+
+    #[test]
+    fn ui_mode_wrong_type_degrades_to_tray_without_failing_the_parse() {
+        let json = r#"{ "ui_mode": 5, "port": 40001 }"#;
+        let cfg: PatchbayConfig = serde_json::from_str(json).expect("must still parse");
+        assert_eq!(cfg.ui_mode, UiMode::Tray);
+        assert_eq!(cfg.port, 40001);
+    }
+
+    #[test]
+    fn ui_mode_round_trips_through_serialization() {
+        let mut cfg = cfg_with_jacks(vec![]);
+        cfg.ui_mode = UiMode::Both;
+        let text = serde_json::to_string(&cfg).expect("serialize");
+        assert!(text.contains(r#""ui_mode":"both""#), "got {}", text);
+        let back: PatchbayConfig = serde_json::from_str(&text).expect("deserialize");
+        assert_eq!(back.ui_mode, UiMode::Both);
+    }
+
+    #[test]
+    fn ui_mode_click_routing_predicates() {
+        // W-D1: the left button decides window-vs-menu; the right button decides
+        // full-vs-minimal menu.
+        assert!(!UiMode::Tray.window_on_left_click());
+        assert!(UiMode::Window.window_on_left_click());
+        assert!(UiMode::Both.window_on_left_click());
+
+        assert!(UiMode::Tray.full_menu());
+        assert!(!UiMode::Window.full_menu(), "window mode gets the escape hatch only");
+        assert!(UiMode::Both.full_menu());
+
+        assert_eq!(UiMode::Tray.as_str(), "tray");
+        assert_eq!(UiMode::Window.as_str(), "window");
+        assert_eq!(UiMode::Both.as_str(), "both");
+    }
+
+    #[test]
+    fn seen_client_last_seen_defaults_to_none_on_old_configs() {
+        // Pre-S13 entries have no `last_seen`. They must load as None (rendered
+        // "never seen since" and counted as unused) rather than failing.
+        let json = r#"{ "seen_clients": [
+            { "name": "pbprobe", "first_seen": "2026-08-18T22:31:41+02:00" }
+        ] }"#;
+        let cfg: PatchbayConfig = serde_json::from_str(json).expect("must parse");
+        assert_eq!(cfg.seen_clients.len(), 1);
+        assert_eq!(cfg.seen_clients[0].last_seen, None);
+    }
+
+    #[test]
+    fn seen_client_last_seen_round_trips() {
+        let json = r#"{ "seen_clients": [
+            { "name": "Codex", "first_seen": "2026-07-29T16:26:20+02:00",
+              "last_seen": "2026-09-03T11:02:00+02:00" }
+        ] }"#;
+        let cfg: PatchbayConfig = serde_json::from_str(json).expect("must parse");
+        assert_eq!(
+            cfg.seen_clients[0].last_seen.as_deref(),
+            Some("2026-09-03T11:02:00+02:00")
+        );
+        // Round-trip the RECORD, not the config: (S14) the config deliberately
+        // no longer serializes this list at all.
+        let back: SeenClient =
+            serde_json::from_str(&serde_json::to_string(&cfg.seen_clients[0]).unwrap()).unwrap();
+        assert_eq!(back.last_seen, cfg.seen_clients[0].last_seen);
+    }
+
+    #[test]
+    fn the_config_file_no_longer_carries_seen_agents() {
+        // (S14) Read from an old config so an existing install migrates, never
+        // written back — that is what keeps ordinary agent traffic away from
+        // the file holding the secrets. If this key reappears in the output,
+        // the split has quietly undone itself.
+        let json = r#"{ "seen_clients": [
+            { "name": "Codex", "first_seen": "2026-07-29T16:26:20+02:00" }
+        ] }"#;
+        let cfg: PatchbayConfig = serde_json::from_str(json).expect("must parse");
+        assert_eq!(cfg.seen_clients.len(), 1, "an old config must still be read");
+
+        let out = serde_json::to_value(&cfg).unwrap();
+        assert!(
+            out.get("seen_clients").is_none(),
+            "the config serialized the observed-agents list: {}",
+            out
+        );
+        // ...and nothing else went missing with it.
+        assert!(out.get("jacks").is_some());
+        assert!(out.get("client_overrides").is_some());
+        assert!(out.get("forbidden_clients").is_some());
     }
 }

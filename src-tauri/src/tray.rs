@@ -18,13 +18,13 @@ use parking_lot::Mutex;
 use tauri::menu::{
     CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
 };
-use tauri::tray::{TrayIcon, TrayIconId};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconEvent, TrayIconId};
 use tauri::{AppHandle, Manager, Wry};
 
 use crate::app_state::{AppState, GatewayStatus, ToggleResult};
-use crate::config;
+use crate::config::{self, UiMode};
 use crate::gateway;
-use crate::utils::autorun;
+use crate::window::{self as popover, RectPx};
 use crate::utils::log::log;
 
 /// Fixed tray id so handlers can look the icon up to swap menus / set tooltip.
@@ -41,6 +41,16 @@ const ID_OPEN_LOGS: &str = "open_logs";
 const ID_COPY_URL: &str = "copy_url";
 const ID_ABOUT: &str = "about";
 const ID_QUIT: &str = "quit";
+/// (S13) "Show window" — present only in the MINIMAL menu that `ui_mode =
+/// "window"` puts on the right button, so the popover is reachable even if the
+/// user forgets that a left click opens it.
+const ID_SHOW_WINDOW: &str = "show_window";
+/// (S13) The three `Settings -> Interface` entries. Radio-style: exactly one is
+/// checked, and clicking the checked one is a no-op rather than a way to end up
+/// with no interface selected.
+const ID_MODE_TRAY: &str = "mode_tray";
+const ID_MODE_WINDOW: &str = "mode_window";
+const ID_MODE_BOTH: &str = "mode_both";
 
 /// "About" text, written fresh to `About.txt` (next to `patchbay.json`) on
 /// every click so it always matches the running exe, then opened in the OS
@@ -256,7 +266,13 @@ pub fn build_menu(app: &AppHandle, state: &AppState) -> Result<Menu<Wry>, tauri:
 
     // Collect references of mixed menu-item types into one trait-object slice
     // (Submenu::with_items takes &[&dyn IsMenuItem], same as Menu::with_items).
+    // (S13 W-D1) "Interface" — the ONLY way a user in tray mode can discover
+    // and reach the window without hand-editing patchbay.json. It has to live
+    // in the tray precisely because the window it enables is not visible yet.
+    let interface_submenu = build_interface_submenu(app, state)?;
+
     let mut settings_entries: Vec<&dyn IsMenuItem<Wry>> = Vec::new();
+    settings_entries.push(&interface_submenu);
     settings_entries.push(&custom_submenu);
     settings_entries.push(&forbidden_submenu);
     settings_entries.push(&retry_gateway);
@@ -659,6 +675,10 @@ pub fn on_menu_event(app: &AppHandle, event: MenuEvent) {
         ID_REQUIRE_APPROVAL => on_require_approval_click(app),
         ID_REQUEST_LOGGING => on_request_logging_click(app),
         ID_ABOUT => on_about(app),
+        ID_SHOW_WINDOW => on_show_window(app),
+        ID_MODE_TRAY => on_interface_click(app, UiMode::Tray),
+        ID_MODE_WINDOW => on_interface_click(app, UiMode::Window),
+        ID_MODE_BOTH => on_interface_click(app, UiMode::Both),
         ID_QUIT => on_quit(app),
         _ => {}
     }
@@ -815,7 +835,9 @@ fn on_override_click(app: &AppHandle, id: &str) {
 /// (e.g. after a port conflict cleared), then refresh the tooltip so the
 /// Running/Failed result is reflected (S7). `run_gateway` serves forever on
 /// success, so it is spawned detached rather than awaited here.
-fn on_retry_gateway(app: &AppHandle) {
+/// (S13) Also reachable from the window; the two interfaces must trigger the
+/// identical action, not two similar ones.
+pub fn on_retry_gateway(app: &AppHandle) {
     let Some(state) = app_state(app) else {
         return;
     };
@@ -845,7 +867,7 @@ fn on_retry_gateway(app: &AppHandle) {
 
 /// "Reload config": re-read from disk, diff jacks (start newly-patched, stop
 /// removed/unpatched), broadcast, then rebuild the whole menu via `set_menu`.
-fn on_reload(app: &AppHandle) {
+pub fn on_reload(app: &AppHandle) {
     let Some(state) = app_state(app) else {
         return;
     };
@@ -937,7 +959,7 @@ fn on_reload(app: &AppHandle) {
 }
 
 /// "Open config file": open `patchbay.json` for editing.
-fn on_open_config(_app: &AppHandle) {
+pub fn on_open_config(_app: &AppHandle) {
     let path = config::config_file_path();
     log(&format!("tray: opening config file {}", path.display()));
     open_text_file(&path, "config");
@@ -948,7 +970,7 @@ fn on_open_config(_app: &AppHandle) {
 /// Level-2 `requests/` subdir. Launches `explorer.exe <path>` DIRECTLY (not via
 /// `cmd /C start`) — the same direct-launch style as [`open_text_file`], which
 /// sidesteps any broken folder-association the OS might have.
-fn on_open_logs(_app: &AppHandle) {
+pub fn on_open_logs(_app: &AppHandle) {
     let dir = crate::utils::log::logs_dir();
     log(&format!("tray: opening logs folder {}", dir.display()));
     open_folder_in_explorer(&dir);
@@ -957,7 +979,7 @@ fn on_open_logs(_app: &AppHandle) {
 /// "About": write the embedded [`ABOUT_TEXT`] to `About.txt` next to
 /// `patchbay.json` (overwriting it fresh on every click, so it always matches
 /// the running exe's text) then open it.
-fn on_about(_app: &AppHandle) {
+pub fn on_about(_app: &AppHandle) {
     let path = config::config_dir().join("About.txt");
     if let Err(e) = std::fs::write(&path, ABOUT_TEXT) {
         log(&format!("tray: failed to write About.txt: {e}"));
@@ -1033,7 +1055,7 @@ fn open_folder_in_explorer(path: &std::path::Path) {
 /// "Copy gateway URL": put `http://127.0.0.1:<port>/mcp` on the OS clipboard so
 /// the user can paste it into an agent's config. Uses `arboard` (works without
 /// a window); logs the URL on failure so it's still recoverable from the log.
-fn on_copy_url(app: &AppHandle) {
+pub fn on_copy_url(app: &AppHandle) {
     let Some(state) = app_state(app) else {
         return;
     };
@@ -1052,23 +1074,13 @@ fn on_autostart_click(app: &AppHandle) {
     let Some(state) = app_state(app) else {
         return;
     };
-    let current = state.config.read().autostart;
-    let want = !current;
-
-    {
-        let mut cfg = state.config.write();
-        cfg.autostart = want;
-        let snap = cfg.clone();
-        drop(cfg);
-        if let Err(e) = config::save(&snap) {
-            log(&format!("tray: failed to persist autostart: {}", e));
-        }
+    let want = !state.config.read().autostart;
+    // (S13) Delegates to AppState so the tray and the window run the SAME code.
+    if let Err(e) = state.set_autostart(want) {
+        log(&format!("tray: failed to persist autostart: {}", e));
     }
-
-    if let Err(e) = autorun::set_autorun(want) {
-        log(&format!("tray: set_autorun({}) failed: {}", want, e));
-    }
-
+    // Reconcile against the AUTHORITATIVE value: a failed persist leaves the
+    // box where it was rather than showing the intent.
     let actual = state.config.read().autostart;
     set_check(app, ID_AUTOSTART, actual);
 }
@@ -1082,19 +1094,10 @@ fn on_require_approval_click(app: &AppHandle) {
     let Some(state) = app_state(app) else {
         return;
     };
-    let current = state.config.read().require_approval_for_new_clients;
-    let want = !current;
-
-    {
-        let mut cfg = state.config.write();
-        cfg.require_approval_for_new_clients = want;
-        let snap = cfg.clone();
-        drop(cfg);
-        if let Err(e) = config::save(&snap) {
-            log(&format!("tray: failed to persist require_approval: {}", e));
-        }
+    let want = !state.config.read().require_approval_for_new_clients;
+    if let Err(e) = state.set_require_approval(want) {
+        log(&format!("tray: failed to persist require_approval: {}", e));
     }
-
     let actual = state.config.read().require_approval_for_new_clients;
     set_check(app, ID_REQUIRE_APPROVAL, actual);
 }
@@ -1332,20 +1335,252 @@ fn app_state(app: &AppHandle) -> Option<AppState> {
     app.try_state::<AppState>().map(|s| s.inner().clone())
 }
 
+/// (S13 W-D1) Build the `Settings -> Interface` submenu: three radio-style
+/// checks over [`UiMode`].
+///
+/// `CheckMenuItem` rather than a real radio group because muda has no radio
+/// item; the click handler enforces the radio SEMANTICS (exactly one selected,
+/// re-clicking the current one changes nothing) and the menu is rebuilt after
+/// each change so the marks reconcile against the authoritative config.
+fn build_interface_submenu(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<Submenu<Wry>, tauri::Error> {
+    let current = state.config.read().ui_mode;
+    let tray_item = CheckMenuItem::with_id(
+        app,
+        ID_MODE_TRAY,
+        "Tray menu only",
+        true,
+        current == UiMode::Tray,
+        None::<&str>,
+    )?;
+    let window_item = CheckMenuItem::with_id(
+        app,
+        ID_MODE_WINDOW,
+        "Window",
+        true,
+        current == UiMode::Window,
+        None::<&str>,
+    )?;
+    let both_item = CheckMenuItem::with_id(
+        app,
+        ID_MODE_BOTH,
+        "Both (window on left, menu on right)",
+        true,
+        current == UiMode::Both,
+        None::<&str>,
+    )?;
+    let entries: Vec<&dyn IsMenuItem<Wry>> = vec![&tray_item, &window_item, &both_item];
+    Submenu::with_items(app, "Interface", true, &entries)
+}
+
+/// One of the three Interface entries was clicked.
+///
+/// Persists the mode, re-points the tray icon's buttons, and rebuilds the menu
+/// so the check marks reflect the AUTHORITATIVE value — including when the save
+/// failed and nothing actually changed.
+fn on_interface_click(app: &AppHandle, mode: UiMode) {
+    let Some(state) = app_state(app) else {
+        return;
+    };
+    if let Err(e) = state.set_ui_mode(mode) {
+        log(&format!("tray: failed to persist ui_mode: {}", e));
+    }
+    let actual = state.config.read().ui_mode;
+    apply_ui_mode(app, actual);
+    state.notify_state_changed();
+}
+
+/// (S13 W-D1) Build the MINIMAL right-click menu used in `ui_mode = "window"`.
+///
+/// Three items only: reach the popover, re-read the config, leave. This is the
+/// escape hatch of W-D7 — whatever happens to the webview, the user can always
+/// reload their config and quit from the icon. It is deliberately NOT the full
+/// menu: in window mode the full surface lives in the popover, and duplicating
+/// it here would mean maintaining two copies of every checkbox's reconcile
+/// logic.
+fn build_minimal_menu(app: &AppHandle) -> Result<Menu<Wry>, tauri::Error> {
+    let show = MenuItem::with_id(app, ID_SHOW_WINDOW, "Show window", true, None::<&str>)?;
+    let reload = MenuItem::with_id(app, ID_RELOAD, "Reload config", true, None::<&str>)?;
+    let sep = PredefinedMenuItem::separator(app)?;
+    let quit = MenuItem::with_id(app, ID_QUIT, "Quit", true, None::<&str>)?;
+    let entries: Vec<&dyn IsMenuItem<Wry>> = vec![&show, &reload, &sep, &quit];
+    Menu::with_items(app, &entries)
+}
+
+/// (S13 W-D1) Point the tray icon's buttons at the interface `ui_mode` selects.
+///
+/// This is NOT "one `match` in the click handler" — the tray is built with
+/// `show_menu_on_left_click(true)`, and with that set the Win32 shell runs
+/// `TrackPopupMenu` synchronously on a left click, so Tauri never gets to route
+/// the event to a window. The flag must therefore be reconfigured at runtime,
+/// together with which menu is attached:
+///
+/// | mode | left button | right button |
+/// |---|---|---|
+/// | `tray` | full native menu | full native menu |
+/// | `window` | popover | minimal menu |
+/// | `both` | popover | full native menu |
+///
+/// Called at startup and whenever `ui_mode` changes from either interface. If
+/// the webview has already failed to be created this session, `window`/`both`
+/// are treated as `tray` (W-D7) so the user is never left with a button that
+/// does nothing.
+pub fn apply_ui_mode(app: &AppHandle, mode: UiMode) {
+    let effective = if mode.window_on_left_click() && popover::creation_failed(app) {
+        log("tray: popover unavailable this session, forcing tray mode");
+        UiMode::Tray
+    } else {
+        mode
+    };
+
+    let Some(tray) = get_tray(app) else {
+        return;
+    };
+
+    if let Err(e) = tray.set_show_menu_on_left_click(!effective.window_on_left_click()) {
+        log(&format!("tray: set_show_menu_on_left_click failed: {}", e));
+    }
+
+    let menu = if effective.full_menu() {
+        app_state(app).and_then(|state| build_menu(app, &state).ok())
+    } else {
+        build_minimal_menu(app).ok()
+    };
+    match menu {
+        Some(m) => {
+            if let Err(e) = tray.set_menu(Some(m)) {
+                log(&format!("tray: set_menu failed: {}", e));
+            }
+        }
+        None => log("tray: could not build the menu for the current ui_mode"),
+    }
+    log(&format!("tray: ui_mode applied = {}", effective.as_str()));
+}
+
+/// (S13 W1) Raw tray-icon events. Only a LEFT button RELEASE in a window-ish
+/// `ui_mode` is interesting; everything else (right button, enter/leave/move,
+/// and the button-DOWN half of the same click) is ignored.
+///
+/// Acting on `Up` rather than `Down` matters: the popover hides itself on blur
+/// when the button goes down, and [`crate::window::toggle_popover`] needs that
+/// blur to have already been processed to tell "the user is closing this" from
+/// "the user is opening it again".
+pub fn on_tray_icon_event(tray: &TrayIcon<Wry>, event: TrayIconEvent) {
+    let TrayIconEvent::Click {
+        rect,
+        button,
+        button_state,
+        ..
+    } = event
+    else {
+        return;
+    };
+    if button != MouseButton::Left || button_state != MouseButtonState::Up {
+        return;
+    }
+
+    let app = tray.app_handle().clone();
+    let Some(state) = app_state(&app) else {
+        return;
+    };
+    let mode = state.config.read().ui_mode;
+    if !mode.window_on_left_click() {
+        return; // tray mode: Win32 already showed the menu
+    }
+
+    // Physical pixels: the tray rect and the monitor work area must be in the
+    // same space as the position we hand back to the window.
+    let pos = rect.position.to_physical::<i32>(1.0);
+    let size = rect.size.to_physical::<u32>(1.0);
+    let tray_rect = RectPx {
+        x: pos.x,
+        y: pos.y,
+        w: size.width as i32,
+        h: size.height as i32,
+    };
+
+    if !popover::toggle_popover(&app, tray_rect) {
+        // The webview is unavailable — fall back to the native menu for this
+        // session so the click still does something useful.
+        apply_ui_mode(&app, UiMode::Tray);
+    }
+}
+
+/// "Show window" in the minimal menu.
+fn on_show_window(app: &AppHandle) {
+    let rect = app
+        .try_state::<popover::PopoverState>()
+        .and_then(|s| *s.tray_rect.lock());
+    match rect {
+        Some(r) => {
+            if !popover::show_popover(app, r) {
+                apply_ui_mode(app, UiMode::Tray);
+            }
+        }
+        // No tray event has been seen yet this session (the user opened the
+        // menu with the keyboard, say), so there is no icon rectangle to anchor
+        // to. Nothing sane to position against — say so rather than guessing at
+        // (0,0).
+        None => log("tray: Show window requested before any tray click; no anchor rect yet"),
+    }
+}
+
+/// (S13 W-D4) Reconcile every tray check box against the authoritative config,
+/// without rebuilding the menu.
+///
+/// Called by [`crate::app_state::AppState::notify_state_changed`] after ANY
+/// mutation, so a change driven from the popover window is reflected in the
+/// native menu immediately — in `ui_mode = "both"` the two are visible in the
+/// same session and must never disagree.
+///
+/// Deliberately NOT a `rebuild_menu`: rebuilding on every toggle is what
+/// `on_jack_click` has always avoided (it swaps a whole Win32 menu), and doing
+/// it here would make the common path more expensive than before the window
+/// existed. Only the SHAPE of the menu needs a rebuild — see
+/// [`crate::app_state::AppState::notify_structure_changed`].
+pub fn reconcile_checks(app: &AppHandle) {
+    let Some(state) = app_state(app) else {
+        return;
+    };
+    let (lines, autostart, require_approval, request_logging) = {
+        let cfg = state.config.read();
+        (
+            cfg.jacks
+                .iter()
+                .map(|j| (j.name.clone(), j.patched))
+                .collect::<Vec<_>>(),
+            cfg.autostart,
+            cfg.require_approval_for_new_clients,
+            cfg.request_logging_enabled,
+        )
+    };
+    for (name, patched) in lines {
+        set_check(app, &name, patched);
+    }
+    set_check(app, ID_AUTOSTART, autostart);
+    set_check(app, ID_REQUIRE_APPROVAL, require_approval);
+    set_check(app, ID_REQUEST_LOGGING, request_logging);
+}
+
 /// Look up the main tray icon (set at startup with id [`TRAY_ID`]).
 fn get_tray(app: &AppHandle) -> Option<TrayIcon<Wry>> {
     app.tray_by_id(&TrayIconId::new(TRAY_ID))
 }
 
 /// Rebuild the menu from the live config and swap it onto the tray icon.
+///
+/// (S13) Routed through [`apply_ui_mode`] so a rebuild can never resurrect the
+/// FULL menu while `ui_mode` says the right button should carry the minimal
+/// one — every rebuild trigger (a reload, a newly-seen agent) would otherwise
+/// quietly undo the mode.
 fn rebuild_menu(app: &AppHandle) -> Result<(), tauri::Error> {
     let Some(state) = app_state(app) else {
         return Ok(());
     };
-    let menu = build_menu(app, &state)?;
-    if let Some(tray) = get_tray(app) {
-        tray.set_menu(Some(menu))?;
-    }
+    let mode = state.config.read().ui_mode;
+    apply_ui_mode(app, mode);
     Ok(())
 }
 

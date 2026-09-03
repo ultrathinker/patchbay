@@ -7,6 +7,7 @@
 pub mod handlers;
 pub mod http;
 pub mod jsonrpc;
+pub mod policy;
 pub mod session;
 pub mod sse;
 pub mod tools;

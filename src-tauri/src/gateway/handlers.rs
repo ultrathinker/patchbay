@@ -186,7 +186,13 @@ async fn handle_initialize(
         .and_then(|p| p.get("clientInfo"))
         .and_then(|ci| {
             let name = ci.get("name")?.as_str()?.to_string();
-            let version = ci.get("version").and_then(|v| v.as_str()).map(str::to_owned);
+            // (S13) The version is display-only, but it is just as
+            // attacker-chosen as the name and is rendered in the same window —
+            // it goes through the same allowlist and length cap.
+            let version = ci
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(crate::app_state::sanitize_client_name);
             Some((Some(name), version))
         })
         .unwrap_or((None, None));
@@ -195,11 +201,17 @@ async fn handle_initialize(
     // `X-Patchbay-Client` header wins over `clientInfo.name`. The HTTP layer
     // already trimmed + empty-filtered; we re-trim/filter here so the function
     // stays correct for any caller (e.g. tests). Both absent -> None (S10).
+    // (S13 W-D11) Sanitized at this ONE point, so every downstream consumer —
+    // the session, `seen_clients`, `client_overrides`, `forbidden_clients`, the
+    // tray label, the log, and the window's Agents list — shares one safe
+    // value and they cannot disagree about who this is. Neither source is
+    // authenticated; see `app_state::sanitize_client_name`.
     let client_name = header_client
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
-        .or(client_info_name);
+        .or(client_info_name)
+        .map(|n| crate::app_state::sanitize_client_name(&n));
 
     // (Review fix) An UNIDENTIFIED connection (no `X-Patchbay-Client` header AND
     // no `clientInfo.name`) can never be looked up in `forbidden_clients` or
@@ -247,6 +259,12 @@ async fn handle_initialize(
         state
             .ensure_client_approved(name, client_version.as_deref())
             .await;
+        // (S13) Record that this identity is STILL in use. `record_seen_client`
+        // is append-only and returns early for a known name, so without this a
+        // client that connects daily looks exactly like one that connected once
+        // in August and never again. Throttled + a no-op for an unknown or
+        // denied identity, so it cannot resurrect anything the gate refused.
+        state.touch_client_last_seen(name);
     }
 
     let result = json!({
@@ -570,12 +588,12 @@ fn builtin_admin_tools() -> Vec<Value> {
     vec![
         json!({
             "name": BUILTIN_ADD_JACK,
-            "description": "Add a new MCP server (\"jack\") to Patchbay. Its tools become available to every agent as namespaced tools <jack>__<tool>. Provide a unique 'name', a 'transport' ('stdio' with a 'command', or 'streamable-http' with a 'url'), and that transport's fields. The jack is saved to patchbay.json and, when patched (the default), started immediately. Returns the new jack's runtime status and tool count.",
+            "description": "Add a new MCP server (\"jack\") definition to Patchbay, SWITCHED OFF. Pass \"patched\": false — Patchbay refuses to add a server already switched on, because switching a server on is the user's decision, not an agent's. The definition is saved to patchbay.json and the user enables it from the tray icon or the Patchbay window, after which its tools appear to every agent as <jack>__<tool> with no reconnection needed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Unique jack name: [A-Za-z0-9_-]+, no '__', <= 40 chars. Used as the tool namespace prefix <name>__<tool>." },
-                    "patched": { "type": "boolean", "default": true, "description": "true (default) starts the jack immediately; false adds it disabled (no tools until toggled on)." },
+                    "patched": { "type": "boolean", "default": true, "description": "MUST be false when an agent adds a jack: the request is refused otherwise. false adds the definition switched off (no tools until the user enables it)." },
                     "transport": { "type": "string", "enum": ["stdio", "streamable-http"], "description": "Transport discriminator. 'stdio': spawn a local process (needs 'command'). 'streamable-http': connect to a remote MCP server (needs 'url')." },
                     "command": { "type": "string", "description": "(stdio) Executable to run, e.g. 'npx'. Required when transport is 'stdio'." },
                     "args": { "type": "array", "items": { "type": "string" }, "description": "(stdio) Arguments passed to 'command'." },
@@ -605,12 +623,12 @@ fn builtin_admin_tools() -> Vec<Value> {
         }),
         json!({
             "name": BUILTIN_TOGGLE_JACK,
-            "description": "Turn a jack ON (patched:true) or OFF (patched:false) in Patchbay. Takes effect immediately for every connected agent (a tools/list_changed broadcast is sent). This is the same pipeline as the tray checkbox toggle.",
+            "description": "Switch a jack OFF (patched:false) in Patchbay — takes effect immediately for every connected agent (a tools/list_changed broadcast is sent). Switching a jack ON is REFUSED for agents: only the user can do that, from the tray icon or the Patchbay window. Use this to drop a server you do not need; do not use it to grant yourself one.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Name of the jack to toggle." },
-                    "patched": { "type": "boolean", "description": "true = ON (start the upstream); false = OFF (stop it)." }
+                    "patched": { "type": "boolean", "description": "false = OFF (stop the upstream). true is refused for agents — ask the user to switch the server on instead." }
                 },
                 "required": ["name", "patched"]
             }
@@ -641,6 +659,14 @@ async fn call_meta_add_jack(
             );
         }
     };
+    // (S14) Adding a server ALREADY running is enabling by another name.
+    if let Err(refusal) = super::policy::check_add(&input.name, input.patched) {
+        crate::utils::request_log::log_event(
+            state,
+            &format!("refused agent request to add jack '{}' switched on", input.name),
+        );
+        return call_tool_result(req, call_tool_error_result(&refusal));
+    }
     match state.add_jack(input).await {
         Ok(s) => {
             let text = format!(
@@ -735,6 +761,14 @@ async fn call_meta_toggle_jack(
             req,
             call_tool_error_result(&format!("Patchbay: jack '{}' not found.", name)),
         );
+    }
+    // (S14) An agent may switch a server off, never on — see `gateway::policy`.
+    if let Err(refusal) = super::policy::check_enable(&name, patched) {
+        crate::utils::request_log::log_event(
+            state,
+            &format!("refused agent request to enable jack '{}'", name),
+        );
+        return call_tool_result(req, call_tool_error_result(&refusal));
     }
     let result = state.set_patched(&name, patched).await;
     let text = format!(
@@ -1217,17 +1251,33 @@ mod tests {
 
     #[tokio::test]
     async fn meta_add_jack_invalid_name_is_call_tool_error() {
-        // Rejected by validation BEFORE config::save -> the real config file is
-        // never touched.
+        // Rejected by validation BEFORE the config is written -> the real
+        // config file is never touched. Sent in the compliant S14 form
+        // (`patched: false`) so this test still exercises NAME validation
+        // rather than stopping at the enable refusal.
         let (is_error, text, is_jsonrpc_error) = call_meta(
             BUILTIN_ADD_JACK,
-            json!({ "name": "bad name", "transport": "stdio", "command": "npx" }),
+            json!({ "name": "bad name", "transport": "stdio", "command": "npx", "patched": false }),
         )
         .await;
         assert!(!is_jsonrpc_error);
         assert!(is_error);
         let text = text.expect("must have text");
         assert!(text.contains("could not add jack"), "text: {}", text);
+
+        // When a request is BOTH not allowed and malformed, the refusal wins.
+        // That ordering is deliberate: an agent should learn that this door is
+        // shut, not be coached through fixing a request it may not make.
+        let (is_error, text, _) = call_meta(
+            BUILTIN_ADD_JACK,
+            json!({ "name": "bad name", "transport": "stdio", "command": "npx" }),
+        )
+        .await;
+        assert!(is_error);
+        assert!(
+            text.expect("must have text").contains("already switched on"),
+            "the S14 refusal must be reported before the validation detail"
+        );
     }
 
     #[tokio::test]
@@ -1434,5 +1484,102 @@ mod tests {
             "non-forbidden client still sees meta tools: {:?}",
             names
         );
+    }
+
+    // ---- S14: an agent may switch a server off, never on -------------------
+
+    /// Like `call_meta`, but against a state the caller keeps, so a test can
+    /// check what the config looks like AFTER the refusal. A guard that
+    /// returns an error and performs the action anyway is worse than none.
+    async fn call_meta_on(st: &AppState, method_name: &str, args: Value) -> (bool, Option<String>) {
+        let session = st.sessions.create();
+        let r = jsonrpc::JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(31)),
+            method: "tools/call".to_string(),
+            params: Some(json!({ "name": method_name, "arguments": args })),
+        };
+        let body = dispatch(st, &r, Some(session), None)
+            .await
+            .body
+            .expect("tools/call must have a body");
+        (
+            body["result"]["isError"].as_bool().unwrap_or(false),
+            body["result"]["content"][0]["text"].as_str().map(str::to_owned),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_agent_cannot_switch_a_jack_on_but_can_switch_it_off() {
+        config::set_test_config_path(Some(config::fresh_test_config_path()));
+        let st = state();
+        // first_run_template's `prod` jack, forced ON in memory without ever
+        // starting a child (its command is never spawned in this test: the only
+        // transition attempted is ON -> OFF, and then a refused OFF -> ON).
+        st.config.write().jacks[0].patched = true;
+        let jack = st.config.read().jacks[0].name.clone();
+
+        let (err, _) = call_meta_on(&st, BUILTIN_TOGGLE_JACK, json!({"name": jack, "patched": false})).await;
+        assert!(!err, "switching a server OFF must stay allowed");
+        assert!(
+            !st.config.read().jacks[0].patched,
+            "switching off must actually take effect"
+        );
+
+        let (err, text) = call_meta_on(&st, BUILTIN_TOGGLE_JACK, json!({"name": jack, "patched": true})).await;
+        assert!(err, "switching a server ON must be refused");
+        let text = text.expect("a refusal must say something");
+        assert!(
+            text.contains("tray"),
+            "the refusal must point at the human control or the model just retries: {}",
+            text
+        );
+        assert!(
+            !st.config.read().jacks[0].patched,
+            "the jack was switched on despite the refusal - the guard is decorative"
+        );
+        config::set_test_config_path(None);
+    }
+
+    #[tokio::test]
+    async fn an_agent_cannot_add_a_jack_that_is_already_switched_on() {
+        config::set_test_config_path(Some(config::fresh_test_config_path()));
+        let st = state();
+        let before = st.config.read().jacks.len();
+
+        let (err, _) = call_meta_on(
+            &st,
+            BUILTIN_ADD_JACK,
+            json!({"name": "sneaky", "transport": "stdio", "command": "cmd", "patched": true}),
+        )
+        .await;
+        assert!(err, "adding an already-running server must be refused");
+        assert_eq!(
+            st.config.read().jacks.len(),
+            before,
+            "the jack was added despite the refusal"
+        );
+
+        // `patched` DEFAULTS to true, so an omitted field must be refused too -
+        // otherwise the laziest call is the one that gets through.
+        let (err, _) = call_meta_on(
+            &st,
+            BUILTIN_ADD_JACK,
+            json!({"name": "sneaky", "transport": "stdio", "command": "cmd"}),
+        )
+        .await;
+        assert!(err, "an omitted `patched` defaults to true and must be refused");
+        assert_eq!(st.config.read().jacks.len(), before);
+
+        // ...and the compliant form still works, or the refusal is a dead end.
+        let (err, _) = call_meta_on(
+            &st,
+            BUILTIN_ADD_JACK,
+            json!({"name": "sneaky", "transport": "stdio", "command": "cmd", "patched": false}),
+        )
+        .await;
+        assert!(!err, "adding a switched-off definition must remain possible");
+        assert_eq!(st.config.read().jacks.len(), before + 1);
+        config::set_test_config_path(None);
     }
 }

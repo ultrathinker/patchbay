@@ -1,0 +1,13 @@
+Vendored frontend libraries — committed to the repo, never fetched at runtime.
+Rationale: WINDOW_UI_PLAN.md W-D3 (no npm, no node_modules, no build step in a
+credential broker). Verified to contain no eval()/new Function, so the strict
+CSP (script-src 'self') in tauri.conf.json is unchanged.
+
+preact 10.25.4   https://cdn.jsdelivr.net/npm/preact@10.25.4/dist/preact.umd.js
+preact/hooks     https://cdn.jsdelivr.net/npm/preact@10.25.4/hooks/dist/hooks.umd.js
+htm 3.1.1        https://cdn.jsdelivr.net/npm/htm@3.1.1/dist/htm.umd.js
+
+Fetched 2026-09-03. SHA-256:
+bf118a2cce52fa1f5d7dfd8c3afaa94e7d1e8ce08ab93265f33f79fd3cb24d62 *preact.umd.js
+c0c4c88a5969719576715a0a47e3ee26100166973b589a4ead54a5de785ac305 *hooks.umd.js
+7a31776e04bd4afde0d4308177d26f377716fcf7e4bd70be590746d6aa594f08 *htm.umd.js

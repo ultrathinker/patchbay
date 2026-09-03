@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
@@ -41,6 +42,17 @@ pub struct AppState {
     /// path, which has no `AppHandle` of its own) can rebuild the tray menu +
     /// refresh the tooltip. `None` until [`AppState::set_tray_handle`] runs.
     pub tray_handle: Arc<RwLock<Option<AppHandle>>>,
+    /// (S13 W-D12) The single-slot undo buffer for agent deletion. Holds ONLY
+    /// the removed agent entities, never a whole-config snapshot — see
+    /// [`AgentTombstone`].
+    pub agent_tombstone: Arc<Mutex<Option<AgentTombstone>>>,
+
+    /// (S13) Per-client throttle for `SeenClient::last_seen` persistence: the
+    /// last moment we WROTE a fresh timestamp for that identity. A chatty agent
+    /// re-initializes often, and every refresh would otherwise rewrite
+    /// `patchbay.json`; see [`AppState::touch_client_last_seen`].
+    pub last_seen_touch: Arc<Mutex<HashMap<String, Instant>>>,
+
     /// In-flight first-connection approval dialogs (S10c), keyed by the client
     /// identity the dialog is asking about. A concurrent `initialize` for the
     /// SAME not-yet-decided identity `subscribe()`s to the stored sender instead
@@ -54,6 +66,119 @@ pub struct AppState {
 /// `Some(false)` (Deny). Concurrent `initialize` requests for the same identity
 /// `subscribe()` to the same sender so only ONE dialog is ever shown.
 type ApprovalSender = tokio::sync::watch::Sender<Option<bool>>;
+
+/// (S13) Minimum interval between two persisted `SeenClient::last_seen`
+/// refreshes for the SAME client. A reconnect storm or a chatty agent must not
+/// turn `patchbay.json` into a write-hot log; 60 s is far finer than anything
+/// the Agents screen renders (relative times and a 30-day "unused" bucket).
+pub const LAST_SEEN_THROTTLE_SECS: u64 = 60;
+
+/// Monotonic source of undo tokens. Process-wide and never reused, so a token
+/// from an earlier deletion can never accidentally match a later one.
+fn next_undo_token() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::SeqCst)
+}
+
+/// (S13 W-D12) What one agent-deletion removed, so it can be put back.
+///
+/// **Entity-scoped on purpose.** Plan v1 proposed keeping a whole
+/// `PatchbayConfig` snapshot and restoring it wholesale; the review showed that
+/// silently obliterates everything else that changed during the undo window — a
+/// jack toggled from the tray, an agent registered by the gateway, a jack added
+/// by an MCP meta tool — and desynchronizes the config from running child
+/// processes, since writing a config field back does not stop or start
+/// anything.
+///
+/// This carries only the removed identities own records. Restoring them
+/// touches nothing else, involves no process lifecycle, and therefore cannot
+/// lose a concurrent change.
+#[derive(Clone, Debug)]
+pub struct AgentTombstone {
+    /// Identifies this specific deletion; a stale token is refused so a second
+    /// deletion cannot be undone by a click meant for the first.
+    pub token: u64,
+    /// `seen_clients` rows that were removed (absent for an identity that was
+    /// only ever denied).
+    pub clients: Vec<crate::config::SeenClient>,
+    /// `client_overrides` entries that were removed, with their jack maps.
+    pub overrides: Vec<(String, ClientOverride)>,
+    /// Identities that were in `forbidden_clients`.
+    pub forbidden: Vec<String>,
+}
+
+/// Longest client identity Patchbay will keep. Long enough for every real
+/// agent name seen in the wild ("Claude Code - Personal", "Antigravity-CLI"),
+/// short enough that a name cannot be used to push a UI row off the screen or
+/// bloat the config file.
+pub const MAX_CLIENT_NAME_LEN: usize = 64;
+
+/// (S13 W-D11, layer 1) Reduce a self-reported client identity to a safe
+/// DISPLAY string.
+///
+/// An agent's identity comes from the `X-Patchbay-Client` header or
+/// `clientInfo.name`, and **nothing authenticates either** — any local process
+/// that can reach the gateway picks its own. In the native tray menu that was
+/// inert: `AppendMenuW` treats a string as text and nothing else. In the S13
+/// popover the same string is rendered by a webview, where markup is markup; an
+/// identity like `<img src=x onerror=...>` would be script execution inside a
+/// process that holds the user's MCP credentials, with the Tauri IPC bridge in
+/// reach.
+///
+/// The frontend also escapes by construction, and the popover's capability
+/// grants it almost nothing — this is the first of those layers, not the only
+/// one. It is applied at the single point where the identity is resolved, so
+/// everything downstream (session, `seen_clients`, `client_overrides`,
+/// `forbidden_clients`, the tray label, the log) shares one sanitized value and
+/// they cannot disagree about who this is.
+///
+/// Kept: letters, digits, space, and `. _ - : + @ /` — enough for every real
+/// agent name, including versioned and path-like ones.
+///
+/// Control characters are DROPPED (they have no display value, and an embedded
+/// newline would let an agent forge a line in the diagnostic log). Every other
+/// disallowed character is REPLACED with `_` rather than deleted: deleting
+/// turns `<script>` into the innocuous-looking `script`, whereas `_script_`
+/// shows on its face that something was removed.
+///
+/// This does NOT make identities unforgeable, and is not meant to: two hostile
+/// names can still sanitize to the same string, and an agent can always just
+/// send a trusted agent's name verbatim. Identity here is self-reported and
+/// unauthenticated by design (see `docs/security.md`) — this function's job is
+/// to make the string SAFE TO RENDER, not to make it trustworthy.
+pub fn sanitize_client_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| {
+            if c.is_alphanumeric()
+                || c == ' '
+                || c == '.'
+                || c == '_'
+                || c == '-'
+                || c == ':'
+                || c == '+'
+                || c == '@'
+                || c == '/'
+            {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(MAX_CLIENT_NAME_LEN)
+        .collect();
+    let cleaned = cleaned.trim().to_string();
+    if cleaned.is_empty() {
+        // A name of nothing but control characters still needs a stable key, or
+        // it would be indistinguishable from an unidentified client.
+        "unnamed-agent".to_string()
+    } else {
+        cleaned
+    }
+}
 
 /// Gateway lifecycle status, surfaced via the tray in later stages.
 #[derive(Clone, Debug)]
@@ -75,6 +200,8 @@ impl AppState {
             shutdown_gateway: Arc::new(Notify::new()),
             config_error: Arc::new(RwLock::new(None)),
             tray_handle: Arc::new(RwLock::new(None)),
+            agent_tombstone: Arc::new(Mutex::new(None)),
+            last_seen_touch: Arc::new(Mutex::new(HashMap::new())),
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -84,6 +211,406 @@ impl AppState {
     /// after a retry-gateway rebind that reuses the same state) are harmless.
     pub fn set_tray_handle(&self, handle: AppHandle) {
         *self.tray_handle.write() = Some(handle);
+    }
+
+    /// (S13 W-D4) THE fan-out point: tell every user interface that something
+    /// changed.
+    ///
+    /// Plan v1 proposed pairing a UI event with each `rebuild_menu()` call
+    /// site. That was checked against this codebase and found false: there are
+    /// only TWO such sites (a config reload and a newly-seen client), and the
+    /// hot path — `on_jack_click` → `set_patched` → `set_check` — is not one of
+    /// them. Pairing there would have left the window stale on the single most
+    /// common action in the app, and the tray stale whenever the window drove
+    /// the same action.
+    ///
+    /// So the fan-out lives HERE, at the end of every mutator, and does both
+    /// halves:
+    /// - reconciles the tray's check boxes + tooltip against the authoritative
+    ///   config (cheap: a handful of `set_checked` calls, no menu rebuild, so
+    ///   no Win32 flicker), and
+    /// - emits a fresh [`crate::ui::UiSnapshot`] on
+    ///   [`crate::ui::STATE_EVENT`] (a no-op when no window exists).
+    ///
+    /// Put it in the MUTATORS, never in their callers, so a future caller
+    /// cannot forget. Structural changes — a jack or client added or removed,
+    /// where the menu's SHAPE differs — use
+    /// [`Self::notify_structure_changed`] instead.
+    ///
+    /// Non-blocking: the work is spawned onto the main thread, because a
+    /// gateway worker has no `AppHandle` of its own and must never block on the
+    /// UI thread while holding a config lock.
+    pub fn notify_state_changed(&self) {
+        self.fan_out(false);
+    }
+
+    /// Like [`Self::notify_state_changed`], but the tray menu's SHAPE changed
+    /// (a jack or an agent appeared or disappeared), so the menu is rebuilt
+    /// rather than merely reconciled.
+    pub fn notify_structure_changed(&self) {
+        self.fan_out(true);
+    }
+
+    fn fan_out(&self, rebuild: bool) {
+        let Some(handle) = self.tray_handle.read().clone() else {
+            return; // pre-tray startup, or a unit test: nothing to notify
+        };
+        tauri::async_runtime::spawn(async move {
+            if rebuild {
+                crate::tray::rebuild_menu_and_refresh(&handle);
+            } else {
+                crate::tray::reconcile_checks(&handle);
+                crate::tray::refresh_tooltip(&handle);
+            }
+            if let Some(snapshot) = crate::ui::snapshot_for(&handle) {
+                use tauri::Emitter;
+                if let Err(e) = handle.emit(crate::ui::STATE_EVENT, snapshot) {
+                    log(&format!("notify: emit failed: {}", e));
+                }
+            }
+        });
+    }
+
+    /// (S13 W-D12) Delete one or more agent identities, capturing an undo
+    /// tombstone first.
+    ///
+    /// Each identity is purged through the existing [`Self::delete_client`], so
+    /// the semantics stay in ONE place; this method only adds the "what was
+    /// removed" bookkeeping that makes the window undo strip possible (and that
+    /// the tray one-at-a-time delete never needed).
+    ///
+    /// Returns the undo token. A previous, unused tombstone is discarded — the
+    /// strip is single-slot by design, matching what it shows the user.
+    pub async fn delete_agents(&self, names: &[String]) -> u64 {
+        let tombstone = {
+            let cfg = self.config.read();
+            let mut clients = Vec::new();
+            let mut overrides = Vec::new();
+            let mut forbidden = Vec::new();
+            for name in names {
+                if let Some(c) = cfg.seen_clients.iter().find(|c| c.name == *name) {
+                    clients.push(c.clone());
+                }
+                if let Some(o) = cfg.client_overrides.get(name) {
+                    overrides.push((name.clone(), o.clone()));
+                }
+                if cfg.forbidden_clients.iter().any(|f| f == name) {
+                    forbidden.push(name.clone());
+                }
+            }
+            AgentTombstone {
+                token: next_undo_token(),
+                clients,
+                overrides,
+                forbidden,
+            }
+        };
+        let token = tombstone.token;
+        *self.agent_tombstone.lock() = Some(tombstone);
+
+        for name in names {
+            if let Err(e) = self.delete_client(name).await {
+                log(&format!("delete_agents: '{}' failed: {}", name, e));
+            }
+        }
+        log(&format!(
+            "delete_agents: {} identities purged (undo token {})",
+            names.len(),
+            token
+        ));
+        // Each `delete_client` above already fanned out; this final one is the
+        // authoritative state after the WHOLE batch, so the UI settles once on
+        // the end result instead of on the last agent to be removed.
+        self.notify_structure_changed();
+        token
+    }
+
+    /// (S13 W-D12) Put back exactly what [`Self::delete_agents`] removed.
+    ///
+    /// Re-inserts the stored entities into the CURRENT config rather than
+    /// overwriting it, so any unrelated change made since the deletion survives
+    /// untouched. A token that does not match the held tombstone is refused —
+    /// that is what makes a stale undo strip harmless.
+    pub async fn undo_delete_agents(&self, token: u64) -> Result<usize, String> {
+        let tombstone = {
+            let mut slot = self.agent_tombstone.lock();
+            match slot.as_ref() {
+                Some(t) if t.token == token => slot.take().expect("checked above"),
+                Some(_) => return Err("this undo is no longer available".to_string()),
+                None => return Err("nothing to undo".to_string()),
+            }
+        };
+
+        let restored = tombstone.clients.len().max(tombstone.forbidden.len());
+        let candidate = {
+            let cfg = self.config.read();
+            let mut snap = cfg.clone();
+            let jack_names: Vec<String> = snap.jacks.iter().map(|j| j.name.clone()).collect();
+
+            for c in &tombstone.clients {
+                if !snap.seen_clients.iter().any(|x| x.name == c.name) {
+                    snap.seen_clients.push(c.clone());
+                    // An identity that is known cannot also be denied: if it was
+                    // denied at the gate while it sat deleted, restoring the
+                    // "seen" record without clearing that would put it in both
+                    // lists at once.
+                    snap.forbidden_clients.retain(|f| *f != c.name);
+                }
+            }
+
+            for (name, ovr) in &tombstone.overrides {
+                // Re-key the restored map against the jacks that exist NOW. A
+                // jack removed while the agent was deleted must not come back as
+                // a phantom entry, and a jack added meanwhile needs a value, or
+                // the override map stops mirroring the global list — an
+                // invariant the rest of the config code relies on.
+                let mut rekeyed = ovr.clone();
+                rekeyed.jacks.retain(|jack, _| jack_names.contains(jack));
+                for jack in &jack_names {
+                    rekeyed
+                        .jacks
+                        .entry(jack.clone())
+                        .or_insert_with(|| snap.effective_patched(jack, None));
+                }
+                snap.client_overrides
+                    .entry(name.clone())
+                    .or_insert(rekeyed);
+            }
+
+            for f in &tombstone.forbidden {
+                // Only restore a denial for an identity that has not since been
+                // deliberately re-admitted; silently re-blocking an agent the
+                // user just allowed would be worse than not undoing at all.
+                let re_admitted = snap.seen_clients.iter().any(|c| c.name == *f)
+                    && !tombstone.clients.iter().any(|c| c.name == *f);
+                if !re_admitted && !snap.forbidden_clients.iter().any(|x| x == f) {
+                    snap.forbidden_clients.push(f.clone());
+                }
+            }
+            snap
+        };
+        self.persist(&candidate)?;
+        *self.config.write() = candidate;
+
+        // A restored Custom override can be the only reason a globally-off jack
+        // needs to run. `delete_client` reconciles on the way out; undoing it
+        // has to reconcile on the way back in, or the child stays dead and every
+        // agent keeps a stale tool list.
+        self.reconcile_all_jack_lifecycles().await;
+        self.sessions.broadcast_tools_list_changed().await;
+
+        log(&format!(
+            "undo_delete_agents: {} identities restored",
+            restored
+        ));
+        self.notify_structure_changed();
+        Ok(restored)
+    }
+
+    /// (S13 §3.3) Discard a client preserved Custom list and start again from
+    /// the global one.
+    ///
+    /// The tray cannot express this: `disable_custom_client` keeps the jack map
+    /// so re-enabling restores it, and there is no path back to "just follow the
+    /// global list". Removing the override entry entirely IS that path — the
+    /// next `enable_custom_client` then seeds fresh from global, because seeding
+    /// only happens when no entry exists.
+    pub async fn reset_custom_to_global(&self, client_name: &str) -> Result<(), String> {
+        let candidate = {
+            let cfg = self.config.read();
+            if !cfg.client_overrides.contains_key(client_name) {
+                return Ok(()); // already following the global list
+            }
+            let mut snap = cfg.clone();
+            snap.client_overrides.remove(client_name);
+            snap
+        };
+        self.persist(&candidate)?;
+        // Commit only the collection this method owns. Assigning the whole
+        // candidate would erase anything else that changed while the file was
+        // being written.
+        {
+            let overrides = candidate.client_overrides.clone();
+            self.config.write().client_overrides = overrides;
+        }
+        self.reconcile_all_jack_lifecycles().await;
+        log(&format!(
+            "reset_custom_to_global: '{}' now follows the global list",
+            client_name
+        ));
+        self.notify_structure_changed();
+        Ok(())
+    }
+
+    /// (S13) Persist `autostart` and update the Windows Run key.
+    ///
+    /// Lifted out of the tray click handler so the window drives the SAME code
+    /// rather than a second copy — a duplicated implementation is exactly how
+    /// two UIs start disagreeing. Save-then-commit; the registry write happens
+    /// only after the config is safely on disk, so a failed save cannot leave
+    /// Patchbay launching at boot with a config that says it should not.
+    pub fn set_autostart(&self, enabled: bool) -> Result<(), String> {
+        let candidate = {
+            let cfg = self.config.read();
+            if cfg.autostart == enabled {
+                return Ok(());
+            }
+            let mut snap = cfg.clone();
+            snap.autostart = enabled;
+            snap
+        };
+        self.persist(&candidate)?;
+        self.config.write().autostart = enabled;
+
+        if let Err(e) = crate::utils::autorun::set_autorun(enabled) {
+            log(&format!("set_autostart: set_autorun({}) failed: {}", enabled, e));
+        }
+        self.notify_state_changed();
+        Ok(())
+    }
+
+    /// (S13) Persist `require_approval_for_new_clients`. Save-then-commit; no
+    /// other side effects — OFF means an unknown identity is auto-recorded (the
+    /// pre-S10c behavior), ON means it waits for the approval dialog.
+    pub fn set_require_approval(&self, enabled: bool) -> Result<(), String> {
+        let candidate = {
+            let cfg = self.config.read();
+            if cfg.require_approval_for_new_clients == enabled {
+                return Ok(());
+            }
+            let mut snap = cfg.clone();
+            snap.require_approval_for_new_clients = enabled;
+            snap
+        };
+        self.persist(&candidate)?;
+        self.config.write().require_approval_for_new_clients = enabled;
+        self.notify_state_changed();
+        Ok(())
+    }
+
+    /// (S13) Change the gateway port: persist, then rebind the listener.
+    ///
+    /// Rebinding drops every live MCP session, which is why this is the one
+    /// setting in the window behind an explicit Apply rather than applying on
+    /// click. Save-then-commit: if the config cannot be written, nothing is
+    /// rebound, because a listener on a port the config does not record is a
+    /// state no restart could reproduce.
+    ///
+    /// The listener swap mirrors the reload path: close long-lived SSE
+    /// responses FIRST (otherwise graceful shutdown waits forever on a client
+    /// still attached to the old listener), notify the running gateway to stop,
+    /// then spawn a fresh one.
+    pub async fn set_port(&self, port: u16) -> Result<(), String> {
+        if port == 0 {
+            return Err("port must be between 1 and 65535".to_string());
+        }
+        let candidate = {
+            let cfg = self.config.read();
+            if cfg.port == port {
+                return Ok(());
+            }
+            let mut snap = cfg.clone();
+            snap.port = port;
+            snap
+        };
+        self.persist(&candidate)?;
+        let old = self.config.read().port;
+        self.config.write().port = port;
+        log(&format!("set_port: {} -> {}, rebinding listener", old, port));
+
+        self.sessions.close_all_streams();
+        self.shutdown_gateway.notify_waiters();
+
+        let gw_state = self.clone();
+        tauri::async_runtime::spawn(async move {
+            crate::gateway::run_gateway(gw_state, port).await;
+        });
+
+        // Let the fresh bind settle so the snapshot that follows reports
+        // Running (or Failed) on the NEW port rather than the stale status.
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        crate::utils::request_log::log_event(self, &format!("gateway_port_rebind {}", port));
+        self.notify_state_changed();
+        Ok(())
+    }
+
+    /// (S13 fix) Deny or allow SEVERAL identities in ONE save-and-commit cycle.
+    ///
+    /// The window's multi-select used to call [`Self::set_forbidden`] once per
+    /// agent. Each of those calls clones the config, writes the whole file, and
+    /// then commits — so twenty concurrent calls each carried a candidate
+    /// holding only its OWN change, raced to disk, and whichever finished last
+    /// erased the other nineteen denials. It also meant twenty file writes and
+    /// twenty Win32 menu rebuilds for one click.
+    ///
+    /// One read, one save, one commit, one reconcile, one notify.
+    pub async fn set_forbidden_batch(
+        &self,
+        identities: &[String],
+        forbidden: bool,
+    ) -> Result<usize, String> {
+        if identities.is_empty() {
+            return Ok(0);
+        }
+        let (candidate, changed) = {
+            let cfg = self.config.read();
+            let mut snap = cfg.clone();
+            let before = snap.forbidden_clients.len();
+            if forbidden {
+                for id in identities {
+                    if !snap.forbidden_clients.iter().any(|f| f == id) {
+                        snap.forbidden_clients.push(id.clone());
+                    }
+                }
+            } else {
+                snap.forbidden_clients.retain(|f| !identities.contains(f));
+            }
+            let changed = snap.forbidden_clients.len() != before;
+            (snap, changed)
+        };
+        if !changed {
+            return Ok(0);
+        }
+        self.persist(&candidate)?;
+        let list = candidate.forbidden_clients.clone();
+        // Commit ONLY the collection this method owns, so a concurrent change to
+        // an unrelated field made during the disk write is not clobbered.
+        self.config.write().forbidden_clients = list;
+
+        self.reconcile_all_jack_lifecycles().await;
+        self.sessions.broadcast_tools_list_changed().await;
+        crate::utils::request_log::log_event(
+            self,
+            &format!(
+                "set_forbidden_batch {} identities -> forbidden={}",
+                identities.len(),
+                forbidden
+            ),
+        );
+        self.notify_structure_changed();
+        Ok(identities.len())
+    }
+
+    /// (S13) Persist a new [`crate::config::UiMode`]. Save-then-commit; the
+    /// caller re-points the tray icon's buttons afterwards
+    /// ([`crate::tray::apply_ui_mode`]).
+    pub fn set_ui_mode(&self, mode: crate::config::UiMode) -> Result<(), String> {
+        let candidate = {
+            let cfg = self.config.read();
+            if cfg.ui_mode == mode {
+                return Ok(()); // no-op: no needless save
+            }
+            let mut snap = cfg.clone();
+            snap.ui_mode = mode;
+            snap
+        };
+        self.persist(&candidate)?;
+        self.config.write().ui_mode = mode;
+        log(&format!("ui_mode set to '{}'", mode.as_str()));
+        // In the MUTATOR, not the caller — the rule this file states two
+        // methods above, and which this method was quietly breaking.
+        self.notify_state_changed();
+        Ok(())
     }
 
     /// Snapshot of every jack for the tray menu + tooltip: name + patched flag.
@@ -121,24 +648,65 @@ impl AppState {
         // can't spawn two children (one leaked).
         let _toggle_guard = self.upstream.jack_lock(jack_name).await;
         // 1. Flip config + persist (no guard held across the await below).
+        //
+        // (S13 §6.1) SAVE-THEN-COMMIT, matching `set_forbidden` /
+        // `delete_client` / `disable_custom_client`. This method used to mutate
+        // the LIVE config first and merely log a failed `config::save`, so a
+        // failed persist left runtime and disk disagreeing — on the single most
+        // frequent operation in the app, and with the window UI about to render
+        // that wrong in-memory value confidently.
+        //
+        // The commit deliberately writes back ONLY this jack's flag rather than
+        // assigning the whole candidate snapshot: an unrelated field changed by
+        // another task while we were writing to disk must not be clobbered in
+        // memory. (The on-disk copy can still lag such a change until the next
+        // save — that is inherent to the existing snapshot-save discipline used
+        // everywhere in this file, not something introduced here.)
         let jack_config = {
-            let mut cfg = self.config.write();
-            let jack = match cfg.jacks.iter_mut().find(|j| j.name == jack_name) {
-                Some(j) => j,
-                None => {
+            let candidate = {
+                let cfg = self.config.read();
+                if !cfg.jacks.iter().any(|j| j.name == jack_name) {
                     log(&format!("set_patched: unknown jack '{}'", jack_name));
                     return ToggleResult {
                         patched: false,
                         status: "unknown".to_string(),
                     };
                 }
+                let mut snap = cfg.clone();
+                if let Some(j) = snap.jacks.iter_mut().find(|j| j.name == jack_name) {
+                    j.patched = patched;
+                }
+                snap
             };
-            jack.patched = patched;
-            let snapshot = cfg.clone();
-            drop(cfg);
-            if let Err(e) = config::save(&snapshot) {
-                log(&format!("set_patched: failed to persist config: {}", e));
+
+            if let Err(e) = self.persist(&candidate) {
+                log(&format!(
+                    "set_patched: failed to persist config, NOT committing: {}",
+                    e
+                ));
+                // Report the UNCHANGED authoritative flag so the tray check box
+                // and the window switch both reconcile back to reality.
+                let current = self
+                    .config
+                    .read()
+                    .jacks
+                    .iter()
+                    .find(|j| j.name == jack_name)
+                    .map(|j| j.patched)
+                    .unwrap_or(false);
+                return ToggleResult {
+                    patched: current,
+                    status: format!("failed to persist: {}", e),
+                };
             }
+
+            {
+                let mut cfg = self.config.write();
+                if let Some(j) = cfg.jacks.iter_mut().find(|j| j.name == jack_name) {
+                    j.patched = patched;
+                }
+            }
+
             // Re-read the (now-flipped) jack config for a potential start.
             self.config
                 .read()
@@ -195,6 +763,9 @@ impl AppState {
             self,
             &format!("toggle_jack '{}' -> patched={}", jack_name, patched),
         );
+        // (S13 W-D4) Fan out to EVERY interface from the mutator itself, so
+        // a future caller cannot forget.
+        self.notify_state_changed();
         ToggleResult {
             patched,
             status,
@@ -266,7 +837,7 @@ impl AppState {
         // Build the candidate snapshot from a READ of the live config (no
         // mutation yet) and persist it FIRST. Only commit to the in-memory
         // config once the disk write actually succeeds, so a failed
-        // config::save() can never leave memory and disk diverged.
+        // `persist` can never leave memory and disk diverged.
         {
             let snapshot = {
                 let cfg = self.config.read();
@@ -282,7 +853,7 @@ impl AppState {
                 }
                 snap
             };
-            if let Err(e) = config::save(&snapshot) {
+            if let Err(e) = self.persist(&snapshot) {
                 log(&format!("add_jack: failed to persist config: {}", e));
                 return Err(AddJackError::PersistFailed(e));
             }
@@ -319,6 +890,10 @@ impl AppState {
             self,
             &format!("add_jack '{}' ({})", summary.name, summary.transport),
         );
+        // (S13 W-D4) Fan out to EVERY interface from the mutator itself, so
+        // a future caller cannot forget.
+        // A new jack changes the MENU SHAPE, so the tray is rebuilt.
+        self.notify_structure_changed();
         Ok(summary)
     }
 
@@ -358,7 +933,7 @@ impl AppState {
                 }
                 snap
             };
-            if let Err(e) = config::save(&snapshot) {
+            if let Err(e) = self.persist(&snapshot) {
                 log(&format!("remove_jack: failed to persist config: {}", e));
                 return Err(RemoveJackError::PersistFailed(e));
             }
@@ -368,6 +943,9 @@ impl AppState {
         // 5. Broadcast so connected clients drop the jack's tools.
         self.sessions.broadcast_tools_list_changed().await;
         crate::utils::request_log::log_event(self, &format!("remove_jack '{}'", name));
+        // (S13 W-D4) Fan out to EVERY interface from the mutator itself, so
+        // a future caller cannot forget.
+        self.notify_structure_changed();
         Ok(())
     }
 
@@ -456,6 +1034,7 @@ impl AppState {
         // early-return paths above/below exit before this point, so reaching
         // past this block always means a new client was actually recorded.
         {
+            let now = chrono::Local::now().to_rfc3339();
             let mut cfg = self.config.write();
             if cfg.seen_clients.iter().any(|c| c.name == name) {
                 return;
@@ -463,25 +1042,145 @@ impl AppState {
             cfg.seen_clients.push(crate::config::SeenClient {
                 name: name.to_string(),
                 first_seen_version: version.map(str::to_owned),
-                first_seen: chrono::Local::now().to_rfc3339(),
+                first_seen: now.clone(),
+                // A first sighting IS a sighting: seed last_seen so a client
+                // that connects once and never returns is immediately
+                // distinguishable from one that is still in use.
+                last_seen: Some(now),
             });
             let snap = cfg.clone();
             drop(cfg);
-            if let Err(e) = config::save(&snap) {
+            // (S14) State only: a new agent is an observation, not a
+            // configuration change.
+            if let Err(e) = self.persist_state(&snap) {
                 log(&format!("record_seen_client: failed to persist: {}", e));
             }
         }
         {
             log(&format!("record_seen_client: new client '{}' recorded", name));
-            // Rebuild the menu so the agent appears in the "Custom" submenu. This
-            // crosses from a gateway worker (no AppHandle) onto the main thread;
-            // reuse the same spawn + rebuild_menu pattern the tray handlers use.
-            if let Some(h) = self.tray_handle.read().clone() {
-                tauri::async_runtime::spawn(async move {
-                    crate::tray::rebuild_menu_and_refresh(&h);
-                });
+            // (S13) A new agent changes the menu SHAPE (it appears in the
+            // "Custom" submenu) AND the window's Agents list, so the one
+            // fan-out point handles both. Replaces the hand-rolled spawn +
+            // rebuild that predated the state bus.
+            self.notify_structure_changed();
+        }
+    }
+
+    /// (S13) Refresh `SeenClient::last_seen` for an already-known client.
+    ///
+    /// Called on the `initialize` path for EVERY identified client, including
+    /// ones already in `seen_clients` — [`Self::record_seen_client`]
+    /// deliberately returns early for a known name (it is append-only), so
+    /// before S13 nothing in Patchbay ever recorded that an identity was STILL
+    /// in use. That is exactly what made 60 junk one-shot script identities
+    /// indistinguishable from the handful of live agents in the tray list.
+    ///
+    /// Throttled to one persist per client per [`LAST_SEEN_THROTTLE_SECS`]; a
+    /// throttled call is a pure no-op (no config lock, no disk write). An
+    /// unknown name is ignored — recording a NEW client stays
+    /// [`Self::record_seen_client`]'s job (and goes through the approval gate
+    /// first), so this can never resurrect a deleted or denied identity.
+    ///
+    /// Save-then-commit like every other mutator: the candidate is persisted
+    /// before the live config is touched, and only this one field is written
+    /// back so a concurrent change elsewhere is not clobbered.
+    pub fn touch_client_last_seen(&self, name: &str) {
+        {
+            let mut touched = self.last_seen_touch.lock();
+            if let Some(prev) = touched.get(name) {
+                if prev.elapsed().as_secs() < LAST_SEEN_THROTTLE_SECS {
+                    return;
+                }
+            }
+            touched.insert(name.to_string(), Instant::now());
+        }
+
+        let now = chrono::Local::now().to_rfc3339();
+        let candidate = {
+            let cfg = self.config.read();
+            if !cfg.seen_clients.iter().any(|c| c.name == name) {
+                return; // never-seen identity: not this method's business
+            }
+            let mut snap = cfg.clone();
+            if let Some(c) = snap.seen_clients.iter_mut().find(|c| c.name == name) {
+                c.last_seen = Some(now.clone());
+            }
+            snap
+        };
+
+        // (S14) State only. This is the write that fires roughly once a minute
+        // per active agent; it is precisely what must never reach the config.
+        if let Err(e) = self.persist_state(&candidate) {
+            log(&format!(
+                "touch_client_last_seen: failed to persist for '{}': {}",
+                name, e
+            ));
+            return;
+        }
+
+        {
+            let mut cfg = self.config.write();
+            if let Some(c) = cfg.seen_clients.iter_mut().find(|c| c.name == name) {
+                c.last_seen = Some(now);
             }
         }
+        // (S13 fix) This is a user-visible change — the Agents screen renders
+        // "active 2 minutes ago" from it — so it fans out like every other
+        // mutator. Throttled to once a minute per client, so this cannot become
+        // a notification storm.
+        self.notify_state_changed();
+    }
+
+    /// Persist a candidate config — the ONLY way this type writes to disk.
+    ///
+    /// (B-1) When the file on disk failed to parse at startup, the config held
+    /// in memory is [`crate::config::safe_default`]: no jacks, no known agents,
+    /// no secrets. `main` deliberately does not save it — but every mutator
+    /// did, and the mutators are not all user-initiated. One agent connecting
+    /// is enough to reach `record_seen_client`, and `touch_client_last_seen`
+    /// fires roughly once a minute per active agent. So a corrupt config was a
+    /// timer: within about a minute of starting, the empty default would be
+    /// written over the real file — every server definition and every encrypted
+    /// secret gone, with no backup.
+    ///
+    /// Refusing the write keeps the app fully usable (the tray already shows
+    /// the parse error, and "Reload config" clears it once the file is fixed)
+    /// while the file on disk stays exactly as the user left it.
+    fn persist(&self, candidate: &config::PatchbayConfig) -> Result<(), String> {
+        if let Some(reason) = self.config_error.read().as_ref() {
+            let msg = format!(
+                "refusing to save: the config on disk did not parse ({}), so \
+                 memory holds an empty default. Fix the file and use Reload \
+                 config.",
+                reason
+            );
+            log(&format!("persist: {}", msg));
+            return Err(msg);
+        }
+        config::save(candidate)
+    }
+
+    /// Persist ONLY the observed-agents file (S14), leaving `patchbay.json`
+    /// alone.
+    ///
+    /// For the two mutators driven by traffic rather than by the user:
+    /// [`Self::record_seen_client`] and [`Self::touch_client_last_seen`]. They
+    /// change nothing but `seen_clients`, which no longer lives in the config
+    /// file, so writing the config file for them would rewrite every server
+    /// definition and every encrypted secret several times an hour to record
+    /// something nobody configured.
+    ///
+    /// Guarded like [`Self::persist`], for the same reason: when the config on
+    /// disk did not parse, memory holds an empty default, and its empty
+    /// `seen_clients` must not be written over a real one.
+    fn persist_state(&self, candidate: &config::PatchbayConfig) -> Result<(), String> {
+        if let Some(reason) = self.config_error.read().as_ref() {
+            return Err(format!(
+                "refusing to save: the config on disk did not parse ({})",
+                reason
+            ));
+        }
+        config::save_runtime_state(candidate)
     }
 
     /// Flip ONE jack for ONE client's override list (S10). Lazily creates the
@@ -525,7 +1224,7 @@ impl AppState {
             entry.jacks.insert(jack_name.to_string(), patched);
             let snap = cfg.clone();
             drop(cfg);
-            if let Err(e) = config::save(&snap) {
+            if let Err(e) = self.persist(&snap) {
                 log(&format!("set_client_override: failed to persist: {}", e));
                 return Err(e);
             }
@@ -566,6 +1265,11 @@ impl AppState {
             .config
             .read()
             .effective_patched(jack_name, Some(client_name));
+        // (S13 W-D4) Fan out to EVERY interface from the mutator itself.
+        // Flipping the FIRST jack for a client lazily creates its override,
+        // which changes the "Custom [n/m]" label — cheaper to always rebuild
+        // here than to reason about whether this call was the first one.
+        self.notify_structure_changed();
         Ok(effective)
     }
 
@@ -608,7 +1312,7 @@ impl AppState {
             }
             let snap = cfg.clone();
             drop(cfg);
-            if let Err(e) = config::save(&snap) {
+            if let Err(e) = self.persist(&snap) {
                 log(&format!("enable_custom_client: failed to persist: {}", e));
                 return Err(e);
             }
@@ -641,6 +1345,10 @@ impl AppState {
             self,
             &format!("custom_enable '{}'", client_name),
         );
+        // (S13 W-D4) Fan out to EVERY interface from the mutator itself, so
+        // a future caller cannot forget.
+        // The "Custom [n/m]" submenu LABEL changes, so this is structural.
+        self.notify_structure_changed();
         Ok(())
     }
 
@@ -729,8 +1437,18 @@ impl AppState {
                 let state2 = self.clone();
                 let name_owned = name.to_string();
                 let version_owned = version.map(str::to_owned);
+                let handle_for_dialog = self.tray_handle.read().clone();
                 std::thread::spawn(move || {
+                    // (S13 §4.7) The popover is always-on-top; a modal Win32
+                    // dialog raised underneath it looks like a frozen machine.
+                    // Step it aside for the duration of the prompt.
+                    if let Some(h) = &handle_for_dialog {
+                        crate::window::set_yielding(h, true);
+                    }
                     let allowed = crate::approval::show_approval_dialog(&name_owned);
+                    if let Some(h) = &handle_for_dialog {
+                        crate::window::set_yielding(h, false);
+                    }
                     state2.apply_approval_decision(&name_owned, version_owned.as_deref(), allowed);
                 });
                 rx
@@ -773,7 +1491,7 @@ impl AppState {
         //    config yet), matching the save-then-commit discipline used by
         //    add_jack/remove_jack/set_forbidden: persist FIRST, only commit to
         //    the live config if the disk write actually succeeds, so a failed
-        //    config::save() can never leave memory and disk diverged. On
+        //    `persist` can never leave memory and disk diverged. On
         //    Allow: record seen_clients (with version) + clear stale
         //    forbidden. On Deny: add to forbidden.
         let (candidate, changed) = {
@@ -782,10 +1500,12 @@ impl AppState {
             let changed = if allowed {
                 let mut changed = false;
                 if !candidate.seen_clients.iter().any(|c| c.name == name) {
+                    let now = chrono::Local::now().to_rfc3339();
                     candidate.seen_clients.push(crate::config::SeenClient {
                         name: name.to_string(),
                         first_seen_version: version.map(str::to_owned),
-                        first_seen: chrono::Local::now().to_rfc3339(),
+                        first_seen: now.clone(),
+                        last_seen: Some(now),
                     });
                     changed = true;
                 }
@@ -804,7 +1524,7 @@ impl AppState {
             (candidate, changed)
         };
         if changed {
-            if let Err(e) = config::save(&candidate) {
+            if let Err(e) = self.persist(&candidate) {
                 log(&format!("apply_approval_decision: failed to persist: {}", e));
                 // Fail CLOSED, not open: enforcement here is security-relevant
                 // (a Deny must actually block the session `ensure_client_approved`
@@ -838,11 +1558,8 @@ impl AppState {
         //    / "Forbidden (N)" (Deny) reflect the decision live. Gated on
         //    `changed` so a no-op decision doesn't pointlessly rebuild.
         if changed {
-            if let Some(h) = self.tray_handle.read().clone() {
-                tauri::async_runtime::spawn(async move {
-                    crate::tray::rebuild_menu_and_refresh(&h);
-                });
-            }
+            // (S13) One fan-out for both interfaces.
+            self.notify_structure_changed();
 
             #[cfg(not(test))]
             {
@@ -899,7 +1616,7 @@ impl AppState {
         }
         // Save FIRST; only commit to the live config if the disk write succeeded
         // (so a failed save can never leave memory and disk diverged).
-        if let Err(e) = config::save(&candidate) {
+        if let Err(e) = self.persist(&candidate) {
             log(&format!("set_forbidden: failed to persist: {}", e));
             return Err(e);
         }
@@ -912,6 +1629,10 @@ impl AppState {
             self,
             &format!("set_forbidden '{}' -> forbidden={}", identity, forbidden),
         );
+        // (S13 W-D4) Fan out to EVERY interface from the mutator itself, so
+        // a future caller cannot forget.
+        // The "Forbidden [n]" submenu LABEL changes, so this is structural.
+        self.notify_structure_changed();
         Ok(())
     }
 
@@ -948,7 +1669,7 @@ impl AppState {
             self.sessions.broadcast_tools_list_changed().await;
             return Ok(());
         }
-        if let Err(e) = config::save(&candidate) {
+        if let Err(e) = self.persist(&candidate) {
             log(&format!("disable_custom_client: failed to persist: {}", e));
             return Err(e);
         }
@@ -958,6 +1679,9 @@ impl AppState {
             self,
             &format!("custom_disable '{}'", client_name),
         );
+        // (S13 W-D4) Fan out to EVERY interface from the mutator itself, so
+        // a future caller cannot forget.
+        self.notify_structure_changed();
         Ok(())
     }
 
@@ -1024,7 +1748,7 @@ impl AppState {
         }
         // Save FIRST; only commit to the live config if the disk write succeeded
         // (so a failed save can never leave memory and disk diverged).
-        if let Err(e) = config::save(&candidate) {
+        if let Err(e) = self.persist(&candidate) {
             log(&format!("delete_client: failed to persist: {}", e));
             return Err(e);
         }
@@ -1035,6 +1759,10 @@ impl AppState {
         self.reconcile_all_jack_lifecycles().await;
         crate::utils::request_log::log_event(self, &format!("delete_client '{}'", identity));
         log(&format!("delete_client: '{}' purged from Patchbay", identity));
+        // (S13 W-D4) Fan out to EVERY interface from the mutator itself, so
+        // a future caller cannot forget.
+        // The agent disappears from both submenus: structural.
+        self.notify_structure_changed();
         Ok(())
     }
 
@@ -1056,8 +1784,10 @@ impl AppState {
         if !changed {
             return Ok(());
         }
-        config::save(&candidate)?;
+        self.persist(&candidate)?;
         *self.config.write() = candidate;
+        // (S13 W-D4) Fan out to EVERY interface from the mutator itself.
+        self.notify_state_changed();
         Ok(())
     }
 
@@ -1099,7 +1829,11 @@ impl AppState {
 /// Result of a toggle through [`AppState::set_patched`]: the resulting
 /// `patched` flag (authoritative after the flip) + a status string the caller
 /// surfaces in the UI (tray check reconcile / tooltip) or the debug response.
-#[derive(Clone, Debug)]
+///
+/// `Serialize` since S13: the window's `ui_toggle_jack` returns it straight to
+/// the row that was clicked, so the switch reconciles against the AUTHORITATIVE
+/// result — including a refused toggle, whose status names the reason.
+#[derive(Clone, Debug, Serialize)]
 pub struct ToggleResult {
     pub patched: bool,
     pub status: String,
@@ -1382,12 +2116,138 @@ mod tests {
         }
     }
 
+    // ---- B-1: a corrupt config on disk must survive the app running -------
+
+    #[test]
+    fn a_corrupt_config_is_never_overwritten_by_a_background_mutator() {
+        // Reproduces the real sequence: the file on disk fails to parse, so
+        // `main` puts a safe_default in memory and records the reason. The app
+        // keeps running, an agent connects, and a routine background save
+        // fires. Before the guard, that save wrote the empty default over the
+        // user's real file — every jack and every encrypted secret — within
+        // about a minute of startup, with nothing to restore from.
+        let path = crate::config::fresh_test_config_path();
+        let corrupt = "{ this is not json";
+        std::fs::write(&path, corrupt).expect("write corrupt");
+        crate::config::set_test_config_path(Some(path.clone()));
+
+        let st = state_two_jacks();
+        *st.config_error.write() = Some("parse error".to_string());
+
+        // Every shape of mutator: one that reports its failure, and one that
+        // swallows it (the dangerous kind — nobody is watching its return).
+        let err = st
+            .set_ui_mode(crate::config::UiMode::Window)
+            .expect_err("a save must be refused while the config is corrupt");
+        assert!(err.contains("did not parse"), "unhelpful message: {}", err);
+        st.set_autostart(true).expect_err("also refused");
+        // The dangerous shape: a mutator whose failure nobody looks at. It must
+        // still leave the file alone.
+        st.touch_client_last_seen("codex");
+        let _ = st.set_request_logging_enabled(true);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            corrupt,
+            "the corrupt file was modified — the user's config is what was lost"
+        );
+
+        // And the guard lifts the moment the file is known-good again, or the
+        // app would be permanently read-only after one bad parse.
+        *st.config_error.write() = None;
+        st.set_ui_mode(crate::config::UiMode::Window)
+            .expect("saving must work again once the error is cleared");
+        crate::config::set_test_config_path(None);
+    }
+
+    #[test]
+    fn agent_traffic_never_rewrites_the_config_file() {
+        // The whole point of the S14 split. An agent connecting, and its
+        // once-a-minute liveness refresh, must leave `patchbay.json` byte-for-
+        // byte alone: that file holds every server definition and every
+        // DPAPI-encrypted secret, and rewriting it several times an hour to
+        // record something nobody configured was pure risk for no benefit.
+        let path = crate::config::fresh_test_config_path();
+        crate::config::set_test_config_path(Some(path.clone()));
+
+        let st = state_two_jacks();
+        st.set_require_approval(false).expect("gate off for this test");
+        let before = std::fs::read_to_string(&path).expect("the config must exist by now");
+        let before_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        st.record_seen_client("Codex", Some("1.0"));
+        // The refresh is throttled per client, so drive it past the throttle
+        // rather than pretending one call proves anything.
+        st.last_seen_touch.lock().clear();
+        st.touch_client_last_seen("Codex");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            before,
+            "agent traffic rewrote the config file"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before_mtime,
+            "the config file was rewritten with identical contents - still a              chance to lose it, and still a lie in the file's timestamp"
+        );
+
+        // ...and it did land somewhere: the observation must survive a reload,
+        // or this test would pass equally well if nothing were persisted.
+        let state_path = crate::config::state_path_for(&path);
+        assert!(state_path.exists(), "nothing was written to the state file");
+        let reloaded = crate::config::load_from_path(&path).expect("reload");
+        let codex = reloaded
+            .seen_clients
+            .iter()
+            .find(|c| c.name == "Codex")
+            .expect("the agent was not recorded anywhere");
+        assert!(codex.last_seen.is_some(), "last_seen was not persisted");
+        crate::config::set_test_config_path(None);
+    }
+
+    #[test]
+    fn nothing_writes_the_config_except_the_guarded_helper() {
+        // The guard is only worth having if it cannot be walked around. A new
+        // mutator that calls config::save directly would reintroduce the whole
+        // bug silently, so the ban is checked mechanically rather than
+        // remembered.
+        let src = include_str!("app_state.rs");
+        // Assembled from pieces so this line is not itself a hit: the whole
+        // token never appears in the file, only in the string it builds.
+        let needles = [
+            concat!("config::", "save("),
+            concat!("config::", "save_runtime_state("),
+        ];
+        // The two guard bodies are the only places allowed to call through.
+        // Spelled out rather than located by line number so that moving them
+        // does not silently widen the exemption. Both these literals and the
+        // needles above are assembled from pieces, so this test's own source
+        // is not a hit.
+        let allowed = [
+            concat!("config::", "save(candidate)"),
+            concat!("config::", "save_runtime_state(candidate)"),
+        ];
+        let direct: Vec<&str> = src
+            .lines()
+            .filter(|l| needles.iter().any(|n| l.contains(n)))
+            .filter(|l| !allowed.contains(&l.trim()))
+            .collect();
+        assert!(
+            direct.is_empty(),
+            "these lines bypass AppState::persist and can overwrite a corrupt \
+             config with an empty default: {:?}",
+            direct
+        );
+    }
+
     fn state_two_jacks() -> AppState {
         // `alpha` patched ON, `beta` patched OFF globally.
         let cfg = crate::config::PatchbayConfig {
             version: crate::config::CURRENT_VERSION,
             port: crate::config::DEFAULT_PORT,
             autostart: false,
+            ui_mode: crate::config::UiMode::Tray,
             jacks: vec![
                 JackConfig {
                     name: "alpha".to_string(),
@@ -1929,5 +2789,469 @@ mod tests {
         // A no-op (already at the desired value) is Ok without a disk write.
         st.set_request_logging_enabled(false).unwrap();
         assert!(!st.config.read().request_logging_enabled);
+    }
+
+    // ---- (S13 §6.1) set_patched must SAVE THEN COMMIT --------------------
+
+    /// Route `config::save` at a path that CANNOT be created, so every persist
+    /// attempt fails deterministically.
+    ///
+    /// `save_to_path` calls `create_dir_all(parent)` first, so a merely missing
+    /// directory is not enough — it would be created and the save would SUCCEED.
+    /// Instead we create a real FILE and hang the config path underneath it:
+    /// `create_dir_all` cannot make a directory inside a file, on any platform.
+    fn isolate_config_unwritable() {
+        let mut blocker = std::env::temp_dir();
+        blocker.push(format!(
+            "patchbay_blocker_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&blocker, b"not a directory").expect("create blocker file");
+        let mut p = blocker.clone();
+        p.push("subdir");
+        p.push("patchbay.json");
+        config::set_test_config_path(Some(p));
+    }
+
+    #[tokio::test]
+    async fn set_patched_failed_save_does_not_commit_to_memory() {
+        // Before S13 this method mutated the LIVE config first and only logged a
+        // failed save, so runtime and disk silently disagreed on the app's most
+        // frequent operation — and the window UI would have rendered the wrong
+        // in-memory value with full confidence.
+        isolate_config_unwritable();
+        let st = state_with_prod();
+        assert!(!st.config.read().jacks[0].patched, "template ships prod OFF");
+
+        let result = st.set_patched("prod", true).await;
+
+        assert!(
+            !result.patched,
+            "a failed persist must report the UNCHANGED flag, not the intent"
+        );
+        assert!(
+            result.status.starts_with("failed to persist"),
+            "status must name the failure, got '{}'",
+            result.status
+        );
+        assert!(
+            !st.config.read().jacks[0].patched,
+            "live config must NOT be mutated when the save failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_patched_commits_when_save_succeeds() {
+        isolate_config();
+        let st = state_with_prod();
+        let result = st.set_patched("prod", true).await;
+        assert!(result.patched);
+        assert!(st.config.read().jacks[0].patched);
+    }
+
+    #[tokio::test]
+    async fn set_patched_unknown_jack_is_reported_not_persisted() {
+        isolate_config();
+        let st = state_with_prod();
+        let result = st.set_patched("no-such-jack", true).await;
+        assert!(!result.patched);
+        assert_eq!(result.status, "unknown");
+    }
+
+    // ---- (S13) touch_client_last_seen ------------------------------------
+
+    #[test]
+    fn touch_last_seen_updates_a_known_client() {
+        isolate_config();
+        let mut cfg = first_run_template();
+        cfg.seen_clients.push(crate::config::SeenClient {
+            name: "Codex".to_string(),
+            first_seen_version: None,
+            first_seen: "2026-07-29T16:26:20+02:00".to_string(),
+            last_seen: None,
+        });
+        let st = AppState::new(cfg);
+
+        st.touch_client_last_seen("Codex");
+
+        let got = st.config.read().seen_clients[0].last_seen.clone();
+        assert!(got.is_some(), "a known client's last_seen must be filled");
+        assert_ne!(
+            got.as_deref(),
+            Some("2026-07-29T16:26:20+02:00"),
+            "last_seen must be NOW, not a copy of first_seen"
+        );
+    }
+
+    #[test]
+    fn touch_last_seen_is_throttled_within_the_window() {
+        isolate_config();
+        let mut cfg = first_run_template();
+        cfg.seen_clients.push(crate::config::SeenClient {
+            name: "Codex".to_string(),
+            first_seen_version: None,
+            first_seen: "2026-07-29T16:26:20+02:00".to_string(),
+            last_seen: None,
+        });
+        let st = AppState::new(cfg);
+
+        st.touch_client_last_seen("Codex");
+        let first = st.config.read().seen_clients[0].last_seen.clone();
+        // A reconnect storm: many more calls, all inside the throttle window.
+        for _ in 0..50 {
+            st.touch_client_last_seen("Codex");
+        }
+        let after = st.config.read().seen_clients[0].last_seen.clone();
+
+        assert_eq!(
+            first, after,
+            "within LAST_SEEN_THROTTLE_SECS the value must not be rewritten"
+        );
+        assert!(LAST_SEEN_THROTTLE_SECS >= 30, "throttle must be meaningful");
+    }
+
+    #[test]
+    fn touch_last_seen_ignores_an_unknown_identity() {
+        // Must never be able to resurrect a deleted or gate-denied identity:
+        // recording a NEW client stays record_seen_client's job.
+        isolate_config();
+        let st = state_with_prod();
+        let before = st.config.read().seen_clients.len();
+
+        st.touch_client_last_seen("rogue-never-seen");
+
+        assert_eq!(
+            st.config.read().seen_clients.len(),
+            before,
+            "an unknown identity must not be added to seen_clients"
+        );
+    }
+
+    #[test]
+    fn record_seen_client_seeds_last_seen_on_first_sighting() {
+        isolate_config();
+        let st = state_with_prod();
+        st.record_seen_client("brand-new", Some("1.0"));
+        let cfg = st.config.read();
+        let entry = cfg
+            .seen_clients
+            .iter()
+            .find(|c| c.name == "brand-new")
+            .expect("recorded");
+        assert!(
+            entry.last_seen.is_some(),
+            "a first sighting IS a sighting and must seed last_seen"
+        );
+        assert_eq!(
+            entry.last_seen.as_deref(),
+            Some(entry.first_seen.as_str()),
+            "on a first sighting both timestamps are the same moment"
+        );
+    }
+
+    // ---- (S13 W2) the state bus reaches EVERY mutator ---------------------
+
+    /// Every state-changing method must fan out to both interfaces.
+    ///
+    /// This is a SOURCE-level check, deliberately. The behavioural path runs
+    /// through a Tauri `AppHandle` that unit tests do not have (`fan_out`
+    /// returns early with no tray handle), so a runtime assertion here would
+    /// pass vacuously and prove nothing. What actually needs guarding is the
+    /// human failure the review caught: a mutator that quietly does not tell
+    /// the UI. A future mutator added without a `notify_*` call fails this test
+    /// with the method's own name in the message.
+    #[test]
+    fn every_mutator_fans_out_to_the_ui() {
+        const SOURCE: &str = include_str!("app_state.rs");
+        // Every method that can change what a user sees.
+        // EVERY method that can change what a user sees. The first version of
+        // this list omitted seven of them, which let the test report a complete
+        // state bus while `touch_client_last_seen` and `set_ui_mode` notified
+        // nobody. A list is only a proof of completeness if it is complete.
+        const MUTATORS: &[&str] = &[
+            "set_patched",
+            "add_jack",
+            "remove_jack",
+            "set_client_override",
+            "enable_custom_client",
+            "disable_custom_client",
+            "reset_custom_to_global",
+            "set_forbidden",
+            "set_forbidden_batch",
+            "delete_client",
+            "delete_agents",
+            "undo_delete_agents",
+            "set_request_logging_enabled",
+            "set_autostart",
+            "set_require_approval",
+            "set_port",
+            "set_ui_mode",
+            "touch_client_last_seen",
+            "record_seen_client",
+            "apply_approval_decision",
+        ];
+
+        for name in MUTATORS {
+            // Find the definition, then take everything up to the start of the
+            // next item at the same indentation.
+            let sig_async = format!("    pub async fn {}(", name);
+            let sig_sync = format!("    pub fn {}(", name);
+            let sig_private = format!("    fn {}(", name);
+            let start = SOURCE
+                .find(&sig_async)
+                .or_else(|| SOURCE.find(&sig_sync))
+                .or_else(|| SOURCE.find(&sig_private))
+                .unwrap_or_else(|| panic!("mutator '{}' not found in app_state.rs", name));
+            let rest = &SOURCE[start..];
+            // The body ends at the first line that closes the method at method
+            // indentation: a newline, four spaces, a closing brace, a newline.
+            const METHOD_END: &str = "
+    }
+";
+            let end = rest
+                .find(METHOD_END)
+                .map(|i| i + METHOD_END.len())
+                .unwrap_or(rest.len());
+            let body = &rest[..end];
+
+            assert!(
+                body.contains("notify_state_changed()")
+                    || body.contains("notify_structure_changed()"),
+                "mutator '{}' changes user-visible state but never fans out. Every mutator must call notify_state_changed() or notify_structure_changed() (WINDOW_UI_PLAN W-D4), or the tray and the window silently disagree.",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn set_ui_mode_persists_and_is_idempotent() {
+        isolate_config();
+        let st = state_with_prod();
+        assert_eq!(st.config.read().ui_mode, crate::config::UiMode::Tray);
+
+        st.set_ui_mode(crate::config::UiMode::Window).expect("save");
+        assert_eq!(st.config.read().ui_mode, crate::config::UiMode::Window);
+
+        // A no-op set must not rewrite the file (the early return), and must
+        // still report success.
+        st.set_ui_mode(crate::config::UiMode::Window).expect("no-op");
+        assert_eq!(st.config.read().ui_mode, crate::config::UiMode::Window);
+    }
+
+    // ---- (S13 W-D11) client-name sanitization ----------------------------
+
+    #[test]
+    fn sanitize_keeps_every_real_agent_name_untouched() {
+        // Regression guard with the actual identities from this machine: if
+        // sanitizing renamed them, every existing per-agent override and denial
+        // would silently stop matching.
+        for name in [
+            "Claude Code - Personal",
+            "Claude Code - Work",
+            "Claude Code - MiniMax expert",
+            "Antigravity-CLI",
+            "Kilo-Agent",
+            "OpenCode",
+            "opencode",
+            "Codex",
+            "bee-memory-bank",
+            "agent@host",
+            "tool/sub",
+            "v1.2.3+build",
+        ] {
+            assert_eq!(sanitize_client_name(name), name, "must not rewrite '{}'", name);
+        }
+    }
+
+    #[test]
+    fn sanitize_defuses_markup_in_an_agent_name() {
+        // The whole point of W-D11 layer 1: this string is chosen by whoever
+        // connects, and the window renders it.
+        let hostile = "<img src=x onerror=\"alert(1)\">";
+        let safe = sanitize_client_name(hostile);
+        for ch in ['<', '>', '"', '=', '(', ')'] {
+            assert!(!safe.contains(ch), "'{}' survived in {:?}", ch, safe);
+        }
+    }
+
+    #[test]
+    fn sanitize_replaces_rather_than_deletes_so_tampering_stays_visible() {
+        // Deleting the disallowed characters would turn a hostile name into an
+        // innocent-looking one; replacing them leaves the scar visible.
+        let safe = sanitize_client_name("<script>");
+        assert_eq!(safe, "_script_");
+        assert_ne!(safe, "script", "a sanitized name must not masquerade as a plain one");
+    }
+
+    #[test]
+    fn sanitize_caps_length_and_never_returns_empty() {
+        let long = "x".repeat(500);
+        assert_eq!(
+            sanitize_client_name(&long).chars().count(),
+            MAX_CLIENT_NAME_LEN
+        );
+        assert_eq!(sanitize_client_name("   "), "unnamed-agent");
+        assert_eq!(sanitize_client_name("\u{0}\u{1}"), "unnamed-agent");
+    }
+
+    #[test]
+    fn sanitize_strips_newlines_that_would_forge_log_lines() {
+        // The identity is written into the diagnostic log; an embedded newline
+        // would let an agent inject a fake log entry.
+        let forged = "ok\n[EVENT] custom_disable 'Claude Code - Work'";
+        let safe = sanitize_client_name(forged);
+        assert!(!safe.contains('\n'));
+    }
+
+    // ---- (S13 W-D12) entity-scoped undo ----------------------------------
+
+    fn state_with_agents() -> AppState {
+        let mut cfg = first_run_template();
+        for name in ["keep-me", "junk-a", "junk-b"] {
+            cfg.seen_clients.push(crate::config::SeenClient {
+                name: name.to_string(),
+                first_seen_version: Some("1.0".to_string()),
+                first_seen: "2026-08-18T15:00:00+02:00".to_string(),
+                last_seen: None,
+            });
+        }
+        cfg.client_overrides.insert(
+            "junk-a".to_string(),
+            crate::config::ClientOverride {
+                enabled: true,
+                jacks: BTreeMap::from([("prod".to_string(), true)]),
+            },
+        );
+        AppState::new(cfg)
+    }
+
+    #[tokio::test]
+    async fn undo_restores_only_the_deleted_agents() {
+        isolate_config();
+        let st = state_with_agents();
+
+        let token = st
+            .delete_agents(&["junk-a".to_string(), "junk-b".to_string()])
+            .await;
+        {
+            let cfg = st.config.read();
+            assert!(!cfg.seen_clients.iter().any(|c| c.name == "junk-a"));
+            assert!(!cfg.seen_clients.iter().any(|c| c.name == "junk-b"));
+            assert!(cfg.seen_clients.iter().any(|c| c.name == "keep-me"));
+            assert!(!cfg.client_overrides.contains_key("junk-a"));
+        }
+
+        let restored = st.undo_delete_agents(token).await.expect("undo");
+        assert_eq!(restored, 2);
+        let cfg = st.config.read();
+        assert!(cfg.seen_clients.iter().any(|c| c.name == "junk-a"));
+        assert!(cfg.seen_clients.iter().any(|c| c.name == "junk-b"));
+        assert!(
+            cfg.client_overrides.contains_key("junk-a"),
+            "the agent's Custom list must come back with it"
+        );
+    }
+
+    #[tokio::test]
+    async fn undo_does_not_clobber_a_concurrent_unrelated_change() {
+        // THE bug the review found in plan v1: restoring a whole-config
+        // snapshot would silently revert everything else that happened during
+        // the undo window. Here a jack is toggled and a new agent appears
+        // between the delete and the undo; both must survive.
+        isolate_config();
+        let st = state_with_agents();
+
+        let token = st.delete_agents(&["junk-a".to_string()]).await;
+
+        st.set_patched("prod", true).await;
+        st.record_seen_client("arrived-meanwhile", Some("2.0"));
+
+        st.undo_delete_agents(token).await.expect("undo");
+
+        let cfg = st.config.read();
+        assert!(
+            cfg.seen_clients.iter().any(|c| c.name == "junk-a"),
+            "the deleted agent must be restored"
+        );
+        assert!(
+            cfg.jacks.iter().any(|j| j.name == "prod" && j.patched),
+            "a jack toggled during the undo window must NOT be reverted"
+        );
+        assert!(
+            cfg.seen_clients.iter().any(|c| c.name == "arrived-meanwhile"),
+            "an agent registered during the undo window must NOT be erased"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_undo_token_is_refused() {
+        isolate_config();
+        let st = state_with_agents();
+
+        let first = st.delete_agents(&["junk-a".to_string()]).await;
+        let second = st.delete_agents(&["junk-b".to_string()]).await;
+        assert_ne!(first, second);
+
+        // Clicking the old strip must not undo the NEW deletion.
+        let err = st.undo_delete_agents(first).await.unwrap_err();
+        assert!(err.contains("no longer available"), "got '{}'", err);
+
+        st.undo_delete_agents(second).await.expect("the current undo still works");
+        assert!(st.config.read().seen_clients.iter().any(|c| c.name == "junk-b"));
+        assert!(
+            !st.config.read().seen_clients.iter().any(|c| c.name == "junk-a"),
+            "the superseded deletion stays applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn undo_is_single_use() {
+        isolate_config();
+        let st = state_with_agents();
+        let token = st.delete_agents(&["junk-a".to_string()]).await;
+        st.undo_delete_agents(token).await.expect("first undo");
+        assert!(st.undo_delete_agents(token).await.is_err(), "must not undo twice");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_denied_identity_restores_the_denial() {
+        // A denied identity has no seen_clients row at all — only a
+        // forbidden_clients entry. Undo must bring the DENIAL back, or undoing
+        // would silently re-admit an agent the user had blocked.
+        isolate_config();
+        let mut cfg = first_run_template();
+        cfg.forbidden_clients.push("rogue".to_string());
+        let st = AppState::new(cfg);
+
+        let token = st.delete_agents(&["rogue".to_string()]).await;
+        assert!(st.config.read().forbidden_clients.is_empty());
+
+        st.undo_delete_agents(token).await.expect("undo");
+        assert!(
+            st.config.read().forbidden_clients.iter().any(|f| f == "rogue"),
+            "undo must not silently un-block a blocked agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_custom_to_global_drops_the_preserved_list() {
+        // The operation the tray cannot express: after this, enabling Custom
+        // seeds fresh from the global list instead of restoring the old map.
+        isolate_config();
+        let st = state_with_agents();
+        assert!(st.config.read().client_overrides.contains_key("junk-a"));
+
+        st.reset_custom_to_global("junk-a").await.expect("reset");
+        assert!(
+            !st.config.read().client_overrides.contains_key("junk-a"),
+            "the override entry must be gone, not merely disabled"
+        );
+
+        // And a second call is a harmless no-op.
+        st.reset_custom_to_global("junk-a").await.expect("no-op");
     }
 }
