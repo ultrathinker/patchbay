@@ -1,3 +1,18 @@
+# Dependabot: SECURITY advisories only, no routine version-bump PRs.
+#
+# `open-pull-requests-limit: 0` turns off scheduled version updates while
+# leaving Dependabot security updates (a separate repository setting) fully
+# active. That is the behaviour this project wants:
+#
+# Almost every dependency here is transitive through `tauri`, and the direct
+# ones are deliberately pinned to the versions `tauri` already pulls so that
+# Cargo.lock carries ONE copy of each. A routine bump PAST those versions does
+# not upgrade anything real - it re-adds a second `windows`/`winreg`/`dirs`
+# tree beside Tauri's and makes the build bigger. Dependabot cannot know that,
+# so it kept proposing exactly the change that would have to be reverted, which
+# turns a signal into noise and buries the one kind of PR worth reading.
+#
+# So: no scheduled PRs; a real advisory still opens one.
 version: 2
 updates:
   # Rust dependencies (Cargo.lock lives under src-tauri/)
@@ -5,7 +20,7 @@ updates:
     directory: "/src-tauri"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     # Tauri's LINUX backend (GTK/WebKitGTK) is in Cargo.lock because Cargo
     # records every platform, but Patchbay is Windows-only: none of these
     # crates is ever compiled into the shipped binary. Their versions are
@@ -47,4 +62,4 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.2] — 2026-09-03
+
+Dependency housekeeping only — no behaviour change.
+
+### Changed
+- **19 duplicate crates dropped from the lockfile.** `winreg`, `dirs` and
+  `windows` were pinned a major version behind what `tauri` itself depends on,
+  so Cargo.lock carried both copies of each — two `windows` trees, two `dirs`,
+  two `winreg`. Adopting Tauri's versions removes every duplicate. `windows`
+  0.58 → 0.61 needed two call-site changes: `Win32::Foundation::BOOL` no longer
+  exists (`OpenProcess` takes a plain `bool` for `bInheritHandle`, still
+  `false`), and `LocalFree` now takes `Option<HLOCAL>`.
+- CI moved to `actions/checkout@v7` and `actions/cache@v6`.
+- Dependabot now ignores the GTK/WebKitGTK stack. Those crates are in
+  Cargo.lock only because Cargo records every platform; they belong to Tauri's
+  **Linux** backend, which a Windows-only app never compiles, and their versions
+  are pinned by `tauri` → `gtk` 0.18 regardless. The one open advisory against
+  them (unsoundness in `glib::VariantStrIter`) is unreachable here for the same
+  reason.
+
 ## [1.3.1] — 2026-09-03
 
 Five defects found by a full-application review, three of them reproducible on
