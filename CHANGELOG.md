@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.5] — 2026-09-05
+
+### Added
+- **The popover can be dragged by its header.** It used to stay pinned near
+  the tray icon with no way to move it. The dot, title, and empty header
+  space are now a native drag handle (Tauri's `data-tauri-drag-region`); the
+  URL and close buttons still work as plain clicks and don't start a drag.
+
 ## [1.3.4] — 2026-09-05
 
 ### Fixed

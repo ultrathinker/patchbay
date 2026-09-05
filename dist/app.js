@@ -165,7 +165,7 @@
           " connected";
 
     return html`
-      <div class="header">
+      <div class="header" data-tauri-drag-region="deep">
         <div class="header-top">
           <span class=${cx("dot", g.status)} aria-hidden="true"></span>
           <span class="title">Patchbay</span>

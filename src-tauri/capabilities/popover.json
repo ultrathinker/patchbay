@@ -1,12 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "popover",
-  "description": "Minimal permissions for the S13 popover window. Scoped to that one window, and granting ONLY the event channel it needs to receive UiSnapshot pushes. Window manipulation, filesystem, shell and every other core plugin are deliberately absent: an XSS in a page that renders unauthenticated agent names must have as little to reach for as possible (WINDOW_UI_PLAN.md W-D11 layer 3). Hiding and quitting go through the app's own ui_close_window / ui_quit commands instead of core:window permissions.",
+  "description": "Minimal permissions for the S13 popover window. Scoped to that one window, granting the event channel it needs to receive UiSnapshot pushes plus ONE narrow window permission (S13.3): allow-start-dragging, which is what lets `data-tauri-drag-region` on the header move the frameless window. It has no read/write surface of its own — it only relays an already-pressed mouse button into the OS's native move loop — so it does not widen what an XSS in a page rendering unauthenticated agent names could reach for (WINDOW_UI_PLAN.md W-D11 layer 3). Every OTHER window permission (resize, close, minimize, always-on-top, position/size getters and setters, …), plus filesystem, shell and every other core plugin, are deliberately absent. Hiding and quitting go through the app's own ui_close_window / ui_quit commands instead of core:window permissions.",
   "windows": [
     "popover"
   ],
   "permissions": [
     "core:event:allow-listen",
-    "core:event:allow-unlisten"
+    "core:event:allow-unlisten",
+    "core:window:allow-start-dragging"
   ]
 }
