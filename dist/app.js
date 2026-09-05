@@ -179,6 +179,14 @@
           >
             ${"127.0.0.1:" + g.port}
           </button>
+          <button
+            class="close"
+            title="Close (keeps running in the tray)"
+            aria-label="Close"
+            onClick=${function () { invoke("ui_close_window"); }}
+          >
+            ✕
+          </button>
         </div>
         <div class="subtitle">${subtitle}</div>
         ${g.config_error &&

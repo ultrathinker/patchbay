@@ -143,7 +143,10 @@ server that takes a second to start has nowhere to report "starting…" or
 "failed: connection refused", and flipping four servers means opening the menu
 four times. The popover stays open, shows live state, and supports selection —
 so deleting sixty accumulated agent identities is one filter, one select-all and
-one click instead of sixty menu traversals.
+one click instead of sixty menu traversals. It is resizable by dragging any
+edge — width has a floor so the bottom bar's six links never wrap, height can
+shrink to about three server rows before the list scrolls, and there is no
+upper limit on either.
 
 **What the window shows.**
 

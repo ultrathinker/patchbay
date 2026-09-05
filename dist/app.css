@@ -152,6 +152,28 @@ body {
   color: var(--text);
 }
 
+/* Top-right close (S13.1): hides the popover, does not quit Patchbay — the
+   tooltip says so, because "closing the window" reads as "quitting the app"
+   for anyone used to ordinary windows, and this one only ever hides. */
+.close {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  line-height: 18px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+.close:hover {
+  color: var(--err);
+  border-color: var(--err);
+  background: var(--err-bg);
+}
+
 .subtitle {
   font-size: 11px;
   color: var(--text-dim);
@@ -398,6 +420,14 @@ body {
   height: var(--footer-h);
   display: flex;
   align-items: center;
+  /* (S13.1) Six links (Jacks / Agents N / Settings / Logs / Reload / Quit)
+     used to wrap onto a second row the moment the agent count grew a digit —
+     each link is a flex item with the default flex-shrink:1, so under width
+     pressure the ROW held its size and the LABEL TEXT wrapped inside a link
+     instead. `flex-wrap: nowrap` here plus `flex: 0 0 auto` + `white-space:
+     nowrap` on `.link` below stop that; `POPOVER_W`'s new floor (window.rs)
+     is what guarantees there is always enough width to not need it. */
+  flex-wrap: nowrap;
   gap: 2px;
   padding: 0 8px;
   border-top: 1px solid var(--stroke);
@@ -408,6 +438,7 @@ body {
 }
 
 .link {
+  flex: 0 0 auto;
   font: inherit;
   font-size: 12px;
   color: var(--text-dim);
@@ -415,6 +446,7 @@ body {
   border: 1px solid transparent;
   border-radius: var(--radius);
   padding: 4px 8px;
+  white-space: nowrap;
   cursor: pointer;
 }
 .link:hover {

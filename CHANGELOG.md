@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.3] — 2026-09-05
+
+The popover window: a close button, a resizable window, and a footer that no
+longer wraps.
+
+### Added
+- **Close button** (top right of the popover header). Hides the window,
+  same as clicking away or the tray icon — Patchbay keeps running.
+- **The popover is now resizable.** Drag any edge. Width has a floor — the
+  footer's six links (Jacks / Agents N / Settings / Logs / Reload / Quit)
+  used to wrap onto a second line once the agent count grew a digit, and the
+  floor is sized with margin above what that row needs, so shrinking the
+  window can never bring the wrap back. Height can shrink to about three
+  server rows before the list starts scrolling — short is a legitimate
+  choice, not a broken one. Neither axis has an upper limit.
+
+### Fixed
+- **The footer wrapping onto a second line.** Six links in one row have no
+  slack at all: at the old fixed width, `flex-shrink` on each link squeezed
+  the row until a multi-word label (`Agents 6`) wrapped inside its own
+  button instead of the row wrapping as a whole — which read as a broken
+  layout, not a narrow window. Fixed at the CSS level (`flex-wrap: nowrap`
+  on the footer, `white-space: nowrap` + `flex: 0 0 auto` on each link) so
+  it cannot recur even if a future label runs longer still.
+- **Repositioning after a resize.** Showing the popover always recomputed
+  its position from the built-in default size, never the window's actual
+  current one. Once resizing was possible those could disagree, silently
+  drifting the window away from the tray icon by exactly the size
+  difference on the next open. It now reads the real size back
+  (`WebviewWindow::inner_size`) before positioning.
 ## [1.3.2] — 2026-09-03
 
 Dependency housekeeping only — no behaviour change.

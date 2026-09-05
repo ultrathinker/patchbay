@@ -27,15 +27,34 @@ use crate::utils::log::log;
 /// Window label the popover is addressed by.
 pub const POPOVER_LABEL: &str = "popover";
 
-/// Popover size in LOGICAL pixels.
+/// Popover size in LOGICAL pixels — the size it opens at on first creation,
+/// and (S13.1) the SMALLEST it can be shrunk to.
 ///
-/// Fixed, not content-driven (W1 / review finding 10): a popover pinned above a
-/// bottom taskbar must keep its bottom edge stable, and a height that changed
-/// with the screen would push the window down through the taskbar. Lists scroll
-/// internally instead. 400 px wide is a comfortable one-column measure — wider
-/// than ~440 and it stops reading as a flyout.
-pub const POPOVER_W: f64 = 400.0;
+/// Not content-driven (W1 / review finding 10): a popover pinned above a
+/// bottom taskbar must keep its bottom edge stable while open, and a height
+/// that changed with the content would push the window down through the
+/// taskbar. Lists scroll internally instead (`.list { overflow-y: auto }`,
+/// `app.css`) — the SAME mechanism that now also makes user-resizing
+/// pleasant: grow the window and the scrollbar recedes on its own, with no
+/// code on either side needing to know about the other.
+///
+/// (S13.1) The window is resizable — a fixed size read fine on paper but the
+/// footer's six links (`Jacks · Agents N · Settings · Logs · Reload · Quit`)
+/// wrapped onto a second line at 400 px wide the moment an agent count grew a
+/// digit. `POPOVER_W` is now also the hard MINIMUM width: it is sized with
+/// margin above what that row needs, so shrinking the window can never bring
+/// the wrap back. There is no maximum — [`popover_origin`]'s existing
+/// work-area clamping (already covering a window larger than the screen, see
+/// its tests) is what keeps an enormous window on-screen.
+pub const POPOVER_W: f64 = 460.0;
 pub const POPOVER_H: f64 = 560.0;
+
+/// (S13.1) Minimum HEIGHT the user can shrink the popover to — enough for the
+/// header, the servers toolbar and about three server rows before the list
+/// has to start scrolling. Deliberately smaller than [`POPOVER_H`]: unlike
+/// width, a short popover is a legitimate choice (glance at a couple of
+/// servers), not a broken one, so height has real room to shrink.
+pub const MIN_POPOVER_H: f64 = 320.0;
 
 /// Gap between the popover and the screen edge it is anchored to, in physical
 /// pixels at 100% scaling. Kept small: a flyout should look attached to the
@@ -216,7 +235,13 @@ fn ensure_popover(app: &AppHandle) -> Result<tauri::WebviewWindow, tauri::Error>
     let window = WebviewWindowBuilder::new(app, POPOVER_LABEL, WebviewUrl::App("index.html".into()))
         .title("Patchbay")
         .inner_size(POPOVER_W, POPOVER_H)
-        .resizable(false)
+        // (S13.1) User-resizable, with a floor: below `POPOVER_W` the footer
+        // wraps (see the constant's doc comment), so width cannot shrink past
+        // it at all. Height has genuine room — down to `MIN_POPOVER_H`. No
+        // upper bound on either axis; `popover_origin`'s work-area clamp is
+        // what keeps a since-enlarged window from drifting off-screen.
+        .resizable(true)
+        .min_inner_size(POPOVER_W, MIN_POPOVER_H)
         .maximizable(false)
         .minimizable(false)
         .decorations(false)
@@ -315,20 +340,39 @@ pub fn show_popover(app: &AppHandle, tray: RectPx) -> bool {
         .ok()
         .flatten();
 
+    // (S13.1) The window's ACTUAL current size, not the `POPOVER_W`/`POPOVER_H`
+    // defaults: once resizing is allowed, those two can disagree, and
+    // positioning off the wrong one drifts the popover away from the tray
+    // icon by exactly the size difference — worse the more the user resized
+    // it. `inner_size()` already reports physical pixels, so no separate
+    // scale-factor multiplication is needed for it (unlike the constants,
+    // which are logical and only get one in the fallback arms below).
+    let actual_size = window.inner_size().ok();
+
     let (win_w, win_h, work) = match &monitor {
         Some(m) => {
-            let scale = m.scale_factor();
             let wa = m.work_area();
-            (
-                (POPOVER_W * scale).round() as i32,
-                (POPOVER_H * scale).round() as i32,
-                RectPx {
-                    x: wa.position.x,
-                    y: wa.position.y,
-                    w: wa.size.width as i32,
-                    h: wa.size.height as i32,
-                },
-            )
+            let work = RectPx {
+                x: wa.position.x,
+                y: wa.position.y,
+                w: wa.size.width as i32,
+                h: wa.size.height as i32,
+            };
+            match actual_size {
+                Some(sz) => (sz.width as i32, sz.height as i32, work),
+                None => {
+                    // Reading it back failed (should not happen for a window
+                    // just created/shown before) — fall back to the default,
+                    // scaled for this monitor.
+                    let scale = m.scale_factor();
+                    log("popover: could not read the current window size, positioning at the default size");
+                    (
+                        (POPOVER_W * scale).round() as i32,
+                        (POPOVER_H * scale).round() as i32,
+                        work,
+                    )
+                }
+            }
         }
         None => {
             // No monitor info (rare; e.g. the icon's monitor was just
