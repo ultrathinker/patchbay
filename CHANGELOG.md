@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.4] — 2026-09-05
+
+### Fixed
+- **The popover closed the instant you tried to resize it.** It hid itself on
+  losing focus — ordinary flyout behaviour — and grabbing its own (invisible,
+  frameless) resize border to drag an edge counted as a click outside the
+  window, so it closed under the user's hand before a drag could start. It no
+  longer hides on losing focus, or on any click landing elsewhere. There are
+  now exactly two ways to close it: the tray icon again, or the ✕ button added
+  in 1.3.3.
 ## [1.3.3] — 2026-09-05
 
 The popover window: a close button, a resizable window, and a footer that no

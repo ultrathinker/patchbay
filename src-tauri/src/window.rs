@@ -10,6 +10,16 @@
 //! never leaves `ui_mode = "tray"` never pays for a WebView2 process, and
 //! startup is untouched; after the first open, showing it again is instant.
 //!
+//! ## Closing (S13.2) — unlike a flyout, NOT on losing focus
+//! A first version hid the popover the moment it lost focus, the ordinary
+//! flyout behaviour. That made resizing it impossible: grabbing the (invisible,
+//! `decorations(false)`) resize border to drag an edge is itself a click
+//! outside the webview's content, so the window closed under the user's hand
+//! before a drag could start. There are now exactly two ways to close it — the
+//! tray icon (see [`toggle_popover`]) and the header's ✕ button
+//! (`ui_close_window`) — and neither the window losing focus nor a click
+//! landing anywhere else does anything to it.
+//!
 //! ## Never trap the user (W-D7)
 //! If the webview cannot be created at all (no WebView2 runtime, GPU fault),
 //! the failure is logged, remembered in [`PopoverState::creation_failed`], and
@@ -20,7 +30,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use crate::utils::log::log;
 
@@ -65,21 +75,8 @@ const EDGE_GAP: i32 = 8;
 #[derive(Default)]
 pub struct PopoverState {
     /// The tray icon's screen rectangle from the most recent tray event, used
-    /// both to position the popover and to recognise a dismissing click on the
-    /// icon itself (see [`Self::dismissed_by_tray_click`]).
+    /// to position the popover against it.
     pub tray_rect: Mutex<Option<RectPx>>,
-
-    /// Set when the popover hid itself on losing focus AND the cursor was over
-    /// the tray icon at that moment — i.e. the user clicked the icon to close
-    /// the popover, and the click event that is about to arrive must NOT
-    /// re-open it.
-    ///
-    /// This replaces the "ignore a show request within 250 ms of a blur-hide"
-    /// heuristic of plan v1, which was wrong in both directions: a deliberate
-    /// re-open 200 ms after dismissing elsewhere was swallowed, and on a slow
-    /// machine a 280 ms click re-opened the window the user was closing. The
-    /// cursor either was over the icon or it was not; there is nothing to time.
-    pub dismissed_by_tray_click: AtomicBool,
 
     /// Whether creating the webview has already failed once. Prevents retrying
     /// (and re-logging) on every click, and drives the session-only fallback to
@@ -114,9 +111,6 @@ impl RectPx {
     }
     pub fn center_y(&self) -> i32 {
         self.y + self.h / 2
-    }
-    pub fn contains(&self, px: i32, py: i32) -> bool {
-        px >= self.x && px < self.right() && py >= self.y && py < self.bottom()
     }
 }
 
@@ -201,25 +195,6 @@ pub fn popover_origin(tray: RectPx, work: RectPx, win_w: i32, win_h: i32) -> (i3
     (x, y)
 }
 
-/// Cursor position in physical screen pixels, or `None` if the OS refused.
-#[cfg(windows)]
-fn cursor_pos() -> Option<(i32, i32)> {
-    use windows::Win32::Foundation::POINT;
-    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
-    let mut p = POINT::default();
-    // SAFETY: `GetCursorPos` writes a POINT through the pointer; `p` is a live,
-    // properly aligned local of exactly that type.
-    match unsafe { GetCursorPos(&mut p) } {
-        Ok(()) => Some((p.x, p.y)),
-        Err(_) => None,
-    }
-}
-
-#[cfg(not(windows))]
-fn cursor_pos() -> Option<(i32, i32)> {
-    None
-}
-
 /// Create the popover if it does not exist yet, returning it either way.
 ///
 /// The window is built HIDDEN and unfocused so a creation triggered by
@@ -231,7 +206,6 @@ fn ensure_popover(app: &AppHandle) -> Result<tauri::WebviewWindow, tauri::Error>
     }
 
     log("popover: creating webview window (first use)");
-    let app_for_event = app.clone();
     let window = WebviewWindowBuilder::new(app, POPOVER_LABEL, WebviewUrl::App("index.html".into()))
         .title("Patchbay")
         .inner_size(POPOVER_W, POPOVER_H)
@@ -251,29 +225,7 @@ fn ensure_popover(app: &AppHandle) -> Result<tauri::WebviewWindow, tauri::Error>
         .focused(false)
         .build()?;
 
-    window.on_window_event(move |event| {
-        if let WindowEvent::Focused(false) = event {
-            on_popover_blur(&app_for_event);
-        }
-    });
-
     Ok(window)
-}
-
-/// The popover lost focus: dismiss it, and remember whether the click that
-/// dismissed it landed on the tray icon (so the tray click handler about to run
-/// closes the interaction instead of immediately re-opening the window).
-fn on_popover_blur(app: &AppHandle) {
-    if let Some(state) = app.try_state::<PopoverState>() {
-        let over_tray = match (cursor_pos(), *state.tray_rect.lock()) {
-            (Some((cx, cy)), Some(rect)) => rect.contains(cx, cy),
-            _ => false,
-        };
-        state
-            .dismissed_by_tray_click
-            .store(over_tray, Ordering::SeqCst);
-    }
-    hide_popover(app);
 }
 
 /// (S13 §4.7) Step out of the way of a blocking Win32 dialog.
@@ -409,8 +361,16 @@ pub fn show_popover(app: &AppHandle, tray: RectPx) -> bool {
     true
 }
 
-/// Left-click on the tray icon in `window`/`both` mode: show the popover, or
-/// close the interaction if this very click is what dismissed it.
+/// Left-click on the tray icon in `window`/`both` mode: show the popover if it
+/// is hidden, hide it if it is visible.
+///
+/// (S13.2) The popover no longer hides itself on losing focus — clicking
+/// anywhere outside it, including on its own resize border, used to close it
+/// before a resize drag could even start. The tray icon and the header's ✕
+/// button are now the ONLY two ways to close it, which is also what makes this
+/// toggle simple: nothing else can have hidden the window between one tray
+/// click and the next, so there is no race to guard against and no flag to
+/// consume — a plain visibility check is the whole answer.
 ///
 /// Returns `false` if the popover is unavailable, so the caller can fall back.
 pub fn toggle_popover(app: &AppHandle, tray: RectPx) -> bool {
@@ -421,13 +381,6 @@ pub fn toggle_popover(app: &AppHandle, tray: RectPx) -> bool {
 
     if state.creation_failed.load(Ordering::SeqCst) {
         return false;
-    }
-
-    // The window already hid itself on blur when this click went down. If the
-    // cursor was over the icon at that moment, the user was closing the
-    // popover — consume the flag and stop, rather than re-opening it.
-    if state.dismissed_by_tray_click.swap(false, Ordering::SeqCst) {
-        return true;
     }
 
     if let Some(w) = app.get_webview_window(POPOVER_LABEL) {
@@ -627,19 +580,5 @@ mod tests {
         let (x, y) = popover_origin(tray, work, 400, 560);
         assert_eq!(x, work.right() - 400 - EDGE_GAP);
         assert_eq!(y, tray.center_y() - 280);
-    }
-
-    #[test]
-    fn rect_contains_is_half_open() {
-        let r = RectPx {
-            x: 10,
-            y: 10,
-            w: 5,
-            h: 5,
-        };
-        assert!(r.contains(10, 10));
-        assert!(r.contains(14, 14));
-        assert!(!r.contains(15, 14), "right edge is exclusive");
-        assert!(!r.contains(9, 10));
     }
 }
