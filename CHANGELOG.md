@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.6] — 2026-09-13
+
+### Fixed
+- **No button refreshed a server's tool list.** Patchbay reads each server's
+  tools once, when it connects. A server restarted with new tools (seen with a
+  session-less HTTP server, which gives no sign of the restart) kept its old
+  list in Patchbay indefinitely, and nothing in the UI could fix it: "Reload
+  config" skipped every server already running, and switching a server off and
+  on did not reconnect it when an agent's Custom list still used it (the
+  connection was correctly kept alive for that agent, so "on" found it already
+  running and did nothing). Now "Reload config" reconnects every server that
+  should run, and switching a server ON — globally or in an agent's Custom
+  list — always reconnects it and re-reads its tools. Switching OFF still
+  keeps a connection that a Custom agent needs.
+
 ## [1.3.5] — 2026-09-05
 
 ### Added

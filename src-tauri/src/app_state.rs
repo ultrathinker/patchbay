@@ -634,8 +634,9 @@ impl AppState {
     /// 2. Reconcile the shared child's lifecycle against `should_run_jack` (S10):
     ///    the child runs iff the GLOBAL flag OR any enabled Custom client needs
     ///    it. So toggling the global flag OFF does NOT kill a child some Custom
-    ///    client still relies on, and toggling it ON is a no-op if the child is
-    ///    already alive (kept by a Custom client). A lifecycle change still
+    ///    client still relies on, and toggling it ON reconnects the child even
+    ///    if it was already alive (kept by a Custom client), which re-reads its
+    ///    tool list. A lifecycle change still
     ///    broadcasts `tools/list_changed` (start-then-broadcast for ON,
     ///    broadcast-then-stop for OFF); a no-op lifecycle change (only the
     ///    per-client visibility shifted) still broadcasts so `tools/list`
@@ -727,14 +728,15 @@ impl AppState {
         };
 
         // 2. Decide the child's lifecycle via should_run (S10): GLOBAL OR any
-        //    enabled Custom client needing it. Reconcile against the CURRENT
-        //    runtime state so an already-alive child is never pointlessly
-        //    restarted and a still-needed child is never killed.
+        //    enabled Custom client needing it. A still-needed child is never
+        //    killed. Switching ON always reconnects, even when a Custom client
+        //    kept the child alive: otherwise off→on could never refresh a stale
+        //    tool cache (an upstream restarted with new tools).
         let was_running = self.upstream.is_jack_running(jack_name);
         let should_run = self.config.read().should_run_jack(jack_name);
 
-        if should_run && !was_running {
-            // Turn ON: start (spawn + handshake + cache) THEN broadcast.
+        if should_run && (patched || !was_running) {
+            // Turn ON: (re)start (spawn + handshake + cache) THEN broadcast.
             self.upstream
                 .start_jack(&jack_config, self.sessions.clone(), self.config.clone())
                 .await;
@@ -1243,10 +1245,11 @@ impl AppState {
         // Reconcile the SHARED child lifecycle against the aggregate
         // should_run_jack value. A globally-off jack enabled for this Custom
         // client must start; disabling the last Custom consumer of a globally-off
-        // jack must stop it. Broadcast ordering matches set_patched.
+        // jack must stop it. Broadcast ordering matches set_patched, and so does
+        // "switching ON always reconnects" (refreshes a stale tool cache).
         let was_running = self.upstream.is_jack_running(jack_name);
         let should_run = self.config.read().should_run_jack(jack_name);
-        if should_run && !was_running {
+        if should_run && (patched || !was_running) {
             self.upstream
                 .start_jack(&jack_config, self.sessions.clone(), self.config.clone())
                 .await;

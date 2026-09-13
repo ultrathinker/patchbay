@@ -889,12 +889,16 @@ pub fn on_reload(app: &AppHandle) {
                 *state.config.write() = new_cfg.clone();
 
                 // Reconcile upstreams against should_run (S10): GLOBAL OR any
-                // enabled Custom client. A jack whose child should now run but
-                // isn't -> start; one that should no longer run but is -> stop.
+                // enabled Custom client. Every jack that should run is
+                // reconnected, including ones already running (start_jack stops
+                // the old client first) — Reload is the user's explicit "re-read
+                // everything", so it must also refresh each tool cache and pick
+                // up a changed url/command/header. One that should no longer
+                // run but is -> stop.
                 for jack in &new_cfg.jacks {
                     let should_run = new_cfg.should_run_jack(&jack.name);
                     let is_running = state.upstream.is_jack_running(&jack.name);
-                    if should_run && !is_running {
+                    if should_run {
                         let _g = state.upstream.jack_lock(&jack.name).await;
                         state
                             .upstream
