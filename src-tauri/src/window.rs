@@ -28,9 +28,10 @@
 //! user's setting.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use parking_lot::Mutex;
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Manager, PhysicalSize, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 use crate::utils::log::log;
 
@@ -195,6 +196,117 @@ pub fn popover_origin(tray: RectPx, work: RectPx, win_w: i32, win_h: i32) -> (i3
     (x, y)
 }
 
+/// The smallest PHYSICAL size the popover may have on a monitor at `scale`.
+///
+/// `POPOVER_W` and `MIN_POPOVER_H` are logical, so one window needs a different
+/// number of physical pixels on every monitor and at every display scaling.
+fn min_size_px(scale: f64) -> (u32, u32) {
+    let scale = sane_scale(scale);
+    (
+        (POPOVER_W * scale).ceil() as u32,
+        (MIN_POPOVER_H * scale).ceil() as u32,
+    )
+}
+
+/// A scale factor that can be divided by: anything non-finite or not positive
+/// is treated as 100%.
+fn sane_scale(scale: f64) -> f64 {
+    if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    }
+}
+
+/// (PBAY-2) The size the popover should have when it appears on a monitor at
+/// `monitor_scale`, given the physical size it has now.
+///
+/// The window is created once and then only hidden, so its physical size and
+/// its minimum are decided by whatever the display scaling was at that moment.
+/// After a change of scaling, resolution or monitor (a projector, a dock, the
+/// laptop lid) the old physical size can be SMALLER than the minimum the new
+/// scaling demands: the popover shows up as a cramped sliver, and the first
+/// drag on its edge makes the system snap it up to the minimum in one jump.
+///
+/// So on every show:
+/// - a size laid out at another scaling (`window_scale` differs from
+///   `monitor_scale`) is converted to the new scaling, keeping its logical
+///   size;
+/// - it is raised to the minimum for THIS monitor;
+/// - it is cut down to the work area, so a window that was enlarged on a big
+///   screen cannot come back larger than a smaller one. The minimum wins on a
+///   work area too small to hold it, as everywhere else.
+fn fit_size(current: (u32, u32), window_scale: f64, monitor_scale: f64, work: RectPx) -> (u32, u32) {
+    let monitor_scale = sane_scale(monitor_scale);
+    let ratio = monitor_scale / sane_scale(window_scale);
+    let ratio = if (ratio - 1.0).abs() < 1e-6 { 1.0 } else { ratio };
+
+    let (min_w, min_h) = min_size_px(monitor_scale);
+    let max_w = ((work.w - 2 * EDGE_GAP).max(0) as u32).max(min_w);
+    let max_h = ((work.h - 2 * EDGE_GAP).max(0) as u32).max(min_h);
+
+    let w = (current.0 as f64 * ratio).round() as u32;
+    let h = (current.1 as f64 * ratio).round() as u32;
+    (w.clamp(min_w, max_w), h.clamp(min_h, max_h))
+}
+
+/// A monitor's work area as a [`RectPx`].
+fn work_rect(monitor: &tauri::window::Monitor) -> RectPx {
+    let wa = monitor.work_area();
+    RectPx {
+        x: wa.position.x,
+        y: wa.position.y,
+        w: wa.size.width as i32,
+        h: wa.size.height as i32,
+    }
+}
+
+/// (PBAY-2) Apply [`fit_size`] to the window and tell the system the minimum
+/// that goes with this monitor. Returns the size the window has afterwards
+/// (physical pixels), or `None` when its current size cannot be read.
+///
+/// The minimum is handed over in PHYSICAL pixels on purpose: a logical one is
+/// converted with whatever scale factor the window last heard about, which is
+/// exactly the number that goes stale when the display settings change.
+fn fit_to_monitor(window: &WebviewWindow, monitor_scale: f64, work: RectPx) -> Option<(u32, u32)> {
+    let size = window.inner_size().ok()?;
+    let window_scale = window.scale_factor().unwrap_or(monitor_scale);
+
+    let (min_w, min_h) = min_size_px(monitor_scale);
+    if let Err(e) = window.set_min_size(Some(PhysicalSize::new(min_w, min_h))) {
+        log(&format!("popover: set_min_size failed: {}", e));
+    }
+
+    let (w, h) = fit_size((size.width, size.height), window_scale, monitor_scale, work);
+    if (w, h) == (size.width, size.height) {
+        return Some((w, h));
+    }
+    log(&format!(
+        "popover: resizing {}x{} -> {}x{} for a monitor at {:.2}x (window was laid out at {:.2}x)",
+        size.width, size.height, w, h, monitor_scale, window_scale
+    ));
+    if let Err(e) = window.set_size(PhysicalSize::new(w, h)) {
+        log(&format!("popover: set_size failed: {}", e));
+        return Some((size.width, size.height));
+    }
+    Some((w, h))
+}
+
+/// The window moved to a monitor with another scaling while it was open (it can
+/// be dragged by its header), or the scaling changed under it. The system
+/// resizes it by its own rule right after the event, so the fit waits a moment
+/// and then corrects the result instead of racing it.
+fn refit_after_scale_change(window: &WebviewWindow, scale: f64) {
+    let window = window.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let Ok(Some(monitor)) = window.current_monitor() else {
+            return;
+        };
+        fit_to_monitor(&window, scale, work_rect(&monitor));
+    });
+}
+
 /// Create the popover if it does not exist yet, returning it either way.
 ///
 /// The window is built HIDDEN and unfocused so a creation triggered by
@@ -224,6 +336,15 @@ fn ensure_popover(app: &AppHandle) -> Result<tauri::WebviewWindow, tauri::Error>
         .visible(false)
         .focused(false)
         .build()?;
+
+    // (PBAY-2) A change of display scaling must re-fit the window; see
+    // [`fit_size`].
+    let watched = window.clone();
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::ScaleFactorChanged { scale_factor, .. } = event {
+            refit_after_scale_change(&watched, *scale_factor);
+        }
+    });
 
     Ok(window)
 }
@@ -296,27 +417,20 @@ pub fn show_popover(app: &AppHandle, tray: RectPx) -> bool {
     // defaults: once resizing is allowed, those two can disagree, and
     // positioning off the wrong one drifts the popover away from the tray
     // icon by exactly the size difference — worse the more the user resized
-    // it. `inner_size()` already reports physical pixels, so no separate
-    // scale-factor multiplication is needed for it (unlike the constants,
-    // which are logical and only get one in the fallback arms below).
-    let actual_size = window.inner_size().ok();
-
+    // it. (PBAY-2) That size is first fitted to THIS monitor — see
+    // [`fit_size`] — and `fit_to_monitor` hands back the physical size the
+    // window ends up with (unlike the constants, which are logical and only
+    // get a scale factor in the fallback arms below).
     let (win_w, win_h, work) = match &monitor {
         Some(m) => {
-            let wa = m.work_area();
-            let work = RectPx {
-                x: wa.position.x,
-                y: wa.position.y,
-                w: wa.size.width as i32,
-                h: wa.size.height as i32,
-            };
-            match actual_size {
-                Some(sz) => (sz.width as i32, sz.height as i32, work),
+            let work = work_rect(m);
+            let scale = m.scale_factor();
+            match fit_to_monitor(&window, scale, work) {
+                Some((w, h)) => (w as i32, h as i32, work),
                 None => {
                     // Reading it back failed (should not happen for a window
                     // just created/shown before) — fall back to the default,
                     // scaled for this monitor.
-                    let scale = m.scale_factor();
                     log("popover: could not read the current window size, positioning at the default size");
                     (
                         (POPOVER_W * scale).round() as i32,
@@ -561,6 +675,65 @@ mod tests {
         };
         let (x, y) = popover_origin(tray, work, 400, 560);
         assert_eq!((x, y), (work.x + EDGE_GAP, work.y + EDGE_GAP));
+    }
+
+    fn work_1080p() -> RectPx {
+        RectPx {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1040,
+        }
+    }
+
+    #[test]
+    fn a_size_that_fits_is_left_alone() {
+        let size = fit_size((600, 700), 1.0, 1.0, work_1080p());
+        assert_eq!(size, (600, 700));
+    }
+
+    #[test]
+    fn a_window_smaller_than_the_minimum_is_raised_to_it() {
+        // 460x560 physical pixels laid out at 100%, then the scaling went to
+        // 150% without the window being resized: the minimum there is
+        // 690x480, so the window must grow instead of showing cramped.
+        let size = fit_size((460, 560), 1.5, 1.5, work_1080p());
+        assert_eq!(size, (690, 560));
+
+        let tiny = fit_size((100, 100), 1.0, 1.0, work_1080p());
+        assert_eq!(tiny, (460, 320));
+    }
+
+    #[test]
+    fn a_size_laid_out_at_another_scaling_keeps_its_logical_size() {
+        // 460x560 logical at 100% is 690x840 at 150%.
+        assert_eq!(fit_size((460, 560), 1.0, 1.5, work_1080p()), (690, 840));
+        // And back: 920x1120 at 200% is 460x560 at 100%.
+        assert_eq!(fit_size((920, 1120), 2.0, 1.0, work_1080p()), (460, 560));
+    }
+
+    #[test]
+    fn a_window_larger_than_the_work_area_is_cut_down_to_it() {
+        let size = fit_size((3000, 2000), 1.0, 1.0, work_1080p());
+        assert_eq!(size, (1920 - 2 * EDGE_GAP as u32, 1040 - 2 * EDGE_GAP as u32));
+    }
+
+    #[test]
+    fn the_minimum_wins_on_a_work_area_too_small_for_it() {
+        let work = RectPx {
+            x: 0,
+            y: 0,
+            w: 320,
+            h: 240,
+        };
+        assert_eq!(fit_size((460, 560), 1.0, 1.0, work), (460, 320));
+    }
+
+    #[test]
+    fn a_nonsense_scale_factor_is_treated_as_one() {
+        assert_eq!(min_size_px(0.0), (460, 320));
+        assert_eq!(min_size_px(f64::NAN), (460, 320));
+        assert_eq!(fit_size((500, 400), 0.0, 1.0, work_1080p()), (500, 400));
     }
 
     #[test]

@@ -197,6 +197,11 @@ body {
   flex: 1 1 auto;
   user-select: text;
 }
+/* A note, not a problem: "reloaded", not "something failed". */
+.banner.ok {
+  background: transparent;
+  border-color: var(--ok);
+}
 
 /* ---- section bar (title + actions) -------------------------------------- */
 
@@ -435,6 +440,10 @@ body {
 
 .footer .spacer {
   flex: 1 1 auto;
+}
+.footer .link[disabled] {
+  opacity: 0.55;
+  cursor: default;
 }
 
 .link {

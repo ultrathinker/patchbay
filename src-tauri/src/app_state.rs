@@ -6,6 +6,7 @@
 //! the gateway lifecycle status.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -59,6 +60,12 @@ pub struct AppState {
     /// of popping a second dialog. Entry is removed the moment the decision is
     /// applied (see [`Self::apply_approval_decision`]).
     pub pending_approvals: Arc<Mutex<HashMap<String, ApprovalSender>>>,
+
+    /// A config reload is running right now (PBAY-1). The button gave no sign
+    /// that anything was happening, so it was pressed again and again, and every
+    /// press started another full restart of every jack. A second request while
+    /// this is set is refused instead.
+    pub reloading: Arc<AtomicBool>,
 }
 
 /// One pending approval dialog (S10c): a `tokio::sync::watch` sender carrying
@@ -203,6 +210,7 @@ impl AppState {
             agent_tombstone: Arc::new(Mutex::new(None)),
             last_seen_touch: Arc::new(Mutex::new(HashMap::new())),
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+            reloading: Arc::new(AtomicBool::new(false)),
         }
     }
 

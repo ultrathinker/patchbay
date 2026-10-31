@@ -12,6 +12,8 @@
 //! Menu ids: `"jack:<name>"` per jack, plus the fixed ids below.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -865,101 +867,165 @@ pub fn on_retry_gateway(app: &AppHandle) {
     });
 }
 
-/// "Reload config": re-read from disk, diff jacks (start newly-patched, stop
-/// removed/unpatched), broadcast, then rebuild the whole menu via `set_menu`.
+/// "Reload config" from the tray: the same reload the window's button runs,
+/// without waiting for its report.
 pub fn on_reload(app: &AppHandle) {
-    let Some(state) = app_state(app) else {
-        return;
-    };
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
-        log("tray: reload config requested");
-        // (FIX 4) Use load_result so a corrupt config NEVER wipes the live
-        // in-memory config (and is never overwritten). Keep the current config
-        // on a parse/IO error and surface the reason in the tooltip.
-        match config::load_result() {
-            Ok(new_cfg) => {
-                // The file parsed cleanly: clear any prior config error.
-                *state.config_error.write() = None;
+        let _ = reload_config(&app2).await;
+    });
+}
 
-                let old = state.config.read().clone();
-                let port_changed = new_cfg.port != old.port;
-                let new_port = new_cfg.port;
-                // Replace the in-memory config with the freshly-read disk copy.
-                *state.config.write() = new_cfg.clone();
+/// Clears [`AppState::reloading`] when a reload ends, however it ends.
+struct ReloadGuard(Arc<AtomicBool>);
 
-                // Reconcile upstreams against should_run (S10): GLOBAL OR any
-                // enabled Custom client. Every jack that should run is
-                // reconnected, including ones already running (start_jack stops
-                // the old client first) — Reload is the user's explicit "re-read
-                // everything", so it must also refresh each tool cache and pick
-                // up a changed url/command/header. One that should no longer
-                // run but is -> stop.
-                for jack in &new_cfg.jacks {
-                    let should_run = new_cfg.should_run_jack(&jack.name);
-                    let is_running = state.upstream.is_jack_running(&jack.name);
-                    if should_run {
-                        let _g = state.upstream.jack_lock(&jack.name).await;
-                        state
-                            .upstream
-                            .start_jack(jack, state.sessions.clone(), state.config.clone())
-                            .await;
-                    } else if !should_run && is_running {
-                        let _g = state.upstream.jack_lock(&jack.name).await;
-                        state.upstream.stop_jack(&jack.name).await;
-                    }
-                }
-                // Stop jacks removed from the config entirely.
-                for old_jack in &old.jacks {
-                    if !new_cfg.jacks.iter().any(|j| j.name == old_jack.name) {
-                        let _g = state.upstream.jack_lock(&old_jack.name).await;
-                        state.upstream.stop_jack(&old_jack.name).await;
-                    }
-                }
+impl Drop for ReloadGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
 
-                state.sessions.broadcast_tools_list_changed().await;
+/// Reload: re-read the config from disk, reconnect every jack that should run,
+/// bring a gateway that failed to bind back up, tell the agents their tool
+/// lists changed, and push the new state to the tray AND the window.
+///
+/// `Ok` is a one-line summary of a clean reload. `Err` is something the user
+/// should look at: the file could not be read (the live config is kept), some
+/// jack did not come up, or another reload is already running.
+pub async fn reload_config(app: &AppHandle) -> Result<String, String> {
+    let Some(state) = app_state(app) else {
+        return Err("Patchbay is still starting.".to_string());
+    };
+    if state.reloading.swap(true, Ordering::SeqCst) {
+        log("tray: reload requested while another reload is running; ignored");
+        return Err("A reload is already running.".to_string());
+    }
+    let _guard = ReloadGuard(state.reloading.clone());
+    log("tray: reload config requested");
 
-                if port_changed {
-                    log(&format!(
-                        "tray: gateway port changed {} -> {}, rebinding listener",
-                        old.port, new_port
-                    ));
-                    // End long-lived SSE responses before asking axum to stop;
-                    // otherwise graceful shutdown can wait forever on clients
-                    // connected to the old listener.
-                    state.sessions.close_all_streams();
-                    state.shutdown_gateway.notify_waiters();
+    // (FIX 4) Use load_result so a corrupt config NEVER wipes the live
+    // in-memory config (and is never overwritten). Keep the current config
+    // on a parse/IO error and surface the reason in the tooltip.
+    let outcome = match config::load_result() {
+        Ok(new_cfg) => {
+            // The file parsed cleanly: clear any prior config error.
+            *state.config_error.write() = None;
 
-                    let gw_state = state.clone();
-                    tauri::async_runtime::spawn(async move {
-                        gateway::run_gateway(gw_state, new_port).await;
-                    });
+            let old = state.config.read().clone();
+            let port_changed = new_cfg.port != old.port;
+            let new_port = new_cfg.port;
+            // Replace the in-memory config with the freshly-read disk copy.
+            *state.config.write() = new_cfg.clone();
 
-                    // Give the fresh bind a moment to settle so the final
-                    // tooltip refresh reflects Running/Failed on the new port.
-                    tokio::time::sleep(Duration::from_millis(750)).await;
-                    crate::utils::request_log::log_event(&state, "gateway_port_rebind");
+            // Reconcile upstreams against should_run (S10): GLOBAL OR any
+            // enabled Custom client. Every jack that should run is
+            // reconnected, including ones already running (start_jack stops
+            // the old client first) — Reload is the user's explicit "re-read
+            // everything", so it must also refresh each tool cache and pick
+            // up a changed url/command/header. One that should no longer
+            // run but is -> stop.
+            for jack in &new_cfg.jacks {
+                let should_run = new_cfg.should_run_jack(&jack.name);
+                let is_running = state.upstream.is_jack_running(&jack.name);
+                if should_run {
+                    let _g = state.upstream.jack_lock(&jack.name).await;
+                    state
+                        .upstream
+                        .start_jack(jack, state.sessions.clone(), state.config.clone())
+                        .await;
+                } else if !should_run && is_running {
+                    let _g = state.upstream.jack_lock(&jack.name).await;
+                    state.upstream.stop_jack(&jack.name).await;
                 }
             }
-            Err(config::ConfigError::Missing) => {
-                log("tray: reload skipped — config file missing, keeping current config");
+            // Stop jacks removed from the config entirely.
+            for old_jack in &old.jacks {
+                if !new_cfg.jacks.iter().any(|j| j.name == old_jack.name) {
+                    let _g = state.upstream.jack_lock(&old_jack.name).await;
+                    state.upstream.stop_jack(&old_jack.name).await;
+                }
             }
-            Err(e) => {
-                let reason = e.reason();
+
+            state.sessions.broadcast_tools_list_changed().await;
+
+            if port_changed {
                 log(&format!(
-                    "tray: reload FAILED to parse config ({}), keeping current config",
-                    reason
+                    "tray: gateway port changed {} -> {}, rebinding listener",
+                    old.port, new_port
                 ));
-                *state.config_error.write() = Some(reason);
+                // End long-lived SSE responses before asking axum to stop;
+                // otherwise graceful shutdown can wait forever on clients
+                // connected to the old listener.
+                state.sessions.close_all_streams();
+                state.shutdown_gateway.notify_waiters();
+
+                let gw_state = state.clone();
+                tauri::async_runtime::spawn(async move {
+                    gateway::run_gateway(gw_state, new_port).await;
+                });
+
+                // Give the fresh bind a moment to settle so the final
+                // tooltip refresh reflects Running/Failed on the new port.
+                tokio::time::sleep(Duration::from_millis(750)).await;
+                crate::utils::request_log::log_event(&state, "gateway_port_rebind");
+            } else if matches!(*state.status.read(), GatewayStatus::Failed { .. }) {
+                // (PBAY-1) A gateway that could not bind (the port was busy)
+                // stayed down until "Retry gateway" was pressed; the user's
+                // "make it work again" button now does that too.
+                log("tray: reload found the gateway down; trying to bind again");
+                let gw_state = state.clone();
+                tauri::async_runtime::spawn(async move {
+                    gateway::run_gateway(gw_state, new_port).await;
+                });
+                tokio::time::sleep(Duration::from_millis(750)).await;
+            }
+
+            let wanted: Vec<&str> = new_cfg
+                .jacks
+                .iter()
+                .filter(|j| new_cfg.should_run_jack(&j.name))
+                .map(|j| j.name.as_str())
+                .collect();
+            let down: Vec<&str> = wanted
+                .iter()
+                .copied()
+                .filter(|name| !state.upstream.is_jack_running(name))
+                .collect();
+            if let GatewayStatus::Failed { reason } = &*state.status.read() {
+                Err(format!("Reloaded, but the gateway is down: {}", reason))
+            } else if down.is_empty() {
+                Ok(format!("Reloaded. {} servers running.", wanted.len()))
+            } else {
+                Err(format!(
+                    "Reloaded, but {} of {} servers are not running: {}.",
+                    down.len(),
+                    wanted.len(),
+                    down.join(", ")
+                ))
             }
         }
+        Err(config::ConfigError::Missing) => {
+            log("tray: reload skipped — config file missing, keeping current config");
+            Err("patchbay.json is missing; keeping the current settings.".to_string())
+        }
+        Err(e) => {
+            let reason = e.reason();
+            log(&format!(
+                "tray: reload FAILED to parse config ({}), keeping current config",
+                reason
+            ));
+            *state.config_error.write() = Some(reason.clone());
+            Err(format!("patchbay.json was not reloaded: {}", reason))
+        }
+    };
 
-        // Rebuild the whole menu + refresh the tooltip.
-        let _ = rebuild_menu(&app2);
-        refresh_tooltip(&app2);
-        log("tray: reload config complete");
-        crate::utils::request_log::log_event(&state, "reload_config");
-    });
+    // Rebuild the whole menu, refresh the tooltip AND push a fresh snapshot to
+    // the window (PBAY-1): the reload used to update the tray only, so the
+    // window kept showing the old statuses, tool counts and config error.
+    state.notify_structure_changed();
+    log("tray: reload config complete");
+    crate::utils::request_log::log_event(&state, "reload_config");
+    outcome
 }
 
 /// "Open config file": open `patchbay.json` for editing.
@@ -1678,4 +1744,30 @@ pub fn rebuild_menu_and_refresh(app: &AppHandle) {
         log(&format!("tray: rebuild_menu failed: {}", e));
     }
     refresh_tooltip(app);
+}
+
+#[cfg(test)]
+mod reload_guard_tests {
+    use super::*;
+
+    /// The "a reload is running" flag must come down however the reload ends,
+    /// or the Reload button would refuse every press until the next restart.
+    #[test]
+    fn the_reload_guard_clears_the_flag_when_the_reload_ends() {
+        let flag = Arc::new(AtomicBool::new(true));
+        {
+            let _guard = ReloadGuard(flag.clone());
+            assert!(flag.load(Ordering::SeqCst), "still set while the reload runs");
+        }
+        assert!(!flag.load(Ordering::SeqCst), "cleared once the guard is dropped");
+    }
+
+    /// A second request while one is running is refused: the flag is claimed
+    /// with a swap, and only the caller that saw it clear may proceed.
+    #[test]
+    fn only_one_caller_can_claim_the_reload_flag() {
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(!flag.swap(true, Ordering::SeqCst), "the first claim succeeds");
+        assert!(flag.swap(true, Ordering::SeqCst), "the second sees it taken");
+    }
 }

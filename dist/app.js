@@ -861,8 +861,13 @@
         <button class="link" title="Open the logs folder" onClick=${function () { invoke("ui_open_logs"); }}>
           Logs
         </button>
-        <button class="link" title="Re-read patchbay.json" onClick=${function () { invoke("ui_reload_config"); }}>
-          Reload
+        <button
+          class="link"
+          title="Re-read patchbay.json and reconnect every server"
+          disabled=${props.reloading}
+          onClick=${props.onReload}
+        >
+          ${props.reloading ? "Reloading..." : "Reload"}
         </button>
         <button class="link" title="Quit Patchbay" onClick=${function () { invoke("ui_quit"); }}>
           Quit
@@ -923,6 +928,16 @@
     var s11 = useState([]);
     var order = s11[0];
     var setOrder = s11[1];
+
+    // A reload restarts every server and takes a few seconds; the button says so
+    // while it runs, refuses a second press, and reports how it went.
+    var s12 = useState(false);
+    var reloading = s12[0];
+    var setReloading = s12[1];
+
+    var s13 = useState(null);
+    var info = s13[0];
+    var setInfo = s13[1];
 
     var inFlight = useRef({});
     var searchRef = useRef(null);
@@ -1144,6 +1159,39 @@
       });
     }
 
+    function reloadConfig() {
+      if (reloading) return;
+      setReloading(true);
+      setInfo(null);
+      setToast(null);
+      invoke("ui_reload_config")
+        .then(
+          function (msg) {
+            setInfo(String(msg));
+          },
+          function (err) {
+            setToast(String(err));
+          }
+        )
+        .then(function () {
+          setReloading(false);
+        });
+    }
+
+    // The "reloaded" note goes away by itself; a problem stays until dismissed.
+    useEffect(
+      function () {
+        if (!info) return;
+        var t = setTimeout(function () {
+          setInfo(null);
+        }, 6000);
+        return function () {
+          clearTimeout(t);
+        };
+      },
+      [info]
+    );
+
     function deleteAgents(names) {
       call("ui_delete_agents", { names: names }).then(function (token) {
         if (token === undefined) return;
@@ -1338,6 +1386,14 @@
           </div>
         `}
 
+        ${info &&
+        html`
+          <div class="banner ok">
+            <span class="banner-text">${info}</span>
+            <button class="btn" onClick=${function () { setInfo(null); }}>Dismiss</button>
+          </div>
+        `}
+
         ${toast &&
         html`
           <div class="banner">
@@ -1349,6 +1405,8 @@
         <${Footer}
           screen=${screen === "add" ? "jacks" : screen}
           agentCount=${snapshot.agents.length}
+          reloading=${reloading}
+          onReload=${reloadConfig}
           onScreen=${function (k) {
             setScreen(k);
             setDetail(null);

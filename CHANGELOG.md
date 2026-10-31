@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.7] — 2026-10-31
+
+### Fixed
+- **"Reload" in the window looked like it did nothing.** It restarted the
+  servers but never told the window, so the statuses, tool counts and the
+  config-file warning stayed as they were; the button also gave no sign that
+  anything was happening, and every extra press started another full restart of
+  every server on top of the first. Now the window gets the new state when the
+  reload finishes, the button reads "Reloading..." and ignores presses until it
+  is done, and a note reports the result ("Reloaded. 8 servers running.", or
+  which server did not come back, or why `patchbay.json` could not be read).
+  A reload also brings the gateway back up when it had failed to bind, as
+  "Retry gateway" does.
+- **The window could appear far too small, then jump when resized.** The window
+  is created once and only hidden afterwards, so its size and its minimum
+  stayed as they were when the display scaling, the resolution or the monitor
+  changed (a projector, a dock, a different scaling). The old size could end up
+  below the minimum for the new scaling, and the first drag on an edge made the
+  system snap it up to the minimum in one jump. Every time it is shown, the
+  window is now fitted to the monitor it appears on: converted to the new
+  scaling, raised to that monitor's minimum, and cut down to the work area. The
+  same fit runs when the scaling changes while it is open.
+
 ## [1.3.6] — 2026-09-13
 
 ### Fixed

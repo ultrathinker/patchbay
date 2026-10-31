@@ -427,10 +427,13 @@ pub fn ui_set_request_logging(app: AppHandle, on: bool) -> Result<(), String> {
     state.set_request_logging_enabled(on)
 }
 
-/// Reload `patchbay.json` from disk, exactly as the tray item does.
+/// Reload `patchbay.json` from disk, exactly as the tray item does, and report
+/// how it went: `Ok` carries a one-line summary, `Err` the reason something
+/// needs the user's attention (an unreadable file, a server that would not
+/// start, a reload already running).
 #[tauri::command]
-pub fn ui_reload_config(app: AppHandle) {
-    crate::tray::on_reload(&app);
+pub async fn ui_reload_config(app: AppHandle) -> Result<String, String> {
+    crate::tray::reload_config(&app).await
 }
 
 #[tauri::command]
