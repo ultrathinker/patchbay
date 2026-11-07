@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] — 2026-11-08
+
+### Fixed
+- **macOS: the Window and Both interfaces now work.** On macOS any click on
+  the menu-bar icon opened the menu, so in Window mode the window was reachable
+  only through "Show window", and in Both mode the left click never opened the
+  window. macOS opens a status item's menu on every click while the menu is
+  attached to it, whatever Patchbay asks for, so in these two modes the menu is
+  now attached only for the moment a right click shows it. Left click opens the
+  window, right click opens the menu, as on Windows. Patchbay activates itself
+  while that menu is open (otherwise the first right click after Start at login
+  closed the menu in a third of a second) and hands the focus back to the app
+  you were in when it closes. The Tray menu mode is unchanged.
+- **The small Window-mode menu has an "Interface" submenu.** In Window mode
+  the right-click menu offered only "Show window", "Reload config" and "Quit",
+  so getting back to the tray menu meant finding Settings → Interface inside the
+  window. Both platforms.
+
 ## [1.4.0] — 2026-11-07
 
 Patchbay now runs on macOS as well as Windows. The gateway, the jacks, the
@@ -459,7 +477,8 @@ two-tier logging) and the subsequent security hardening.
   sensitive JSON keys inside logged request params (e.g. a jack's `headers`/`env`
   passed to `patchbay__add_jack`), which header redaction alone could not cover.
 
-[Unreleased]: https://github.com/ultrathinker/patchbay/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/ultrathinker/patchbay/compare/v1.4.1...HEAD
+[1.4.1]: https://github.com/ultrathinker/patchbay/releases/tag/v1.4.1
 [1.4.0]: https://github.com/ultrathinker/patchbay/releases/tag/v1.4.0
 [1.2.13]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.13
 [1.2.12]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.12

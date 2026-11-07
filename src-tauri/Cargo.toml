@@ -1,6 +1,6 @@
 [package]
 name = "patchbay"
-version = "1.4.0"
+version = "1.4.1"
 description = "Patchbay - system-tray MCP gateway that toggles MCP servers for all CLI agents at once"
 authors = ["Patchbay"]
 license = "MIT"
@@ -55,6 +55,10 @@ libc = "0.2"
 # encrypts secret config values (`keychain:` prefix), the counterpart of DPAPI.
 security-framework = "3"
 aes-gcm = "0.10"
+# NSApplication activation around the right-click menu (tray.rs). Same
+# versions tray-icon/tao already pull in, so nothing new is compiled.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "libc", "NSApplication", "NSResponder", "NSRunningApplication", "NSWorkspace"] }
 
 [target.'cfg(windows)'.dependencies]
 # Autostart via the HKCU Run key.

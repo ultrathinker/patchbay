@@ -108,8 +108,8 @@ Inside "Settings":
       Tray menu only (default)   left and right click both open this menu.
       Window                     left click opens the popover window; right
                                  click opens a small menu with just
-                                 "Show window", "Reload config" and "Quit",
-                                 so you are never stuck.
+                                 "Show window", "Interface", "Reload
+                                 config" and "Quit", so you are never stuck.
       Both                       left click opens the window, right click
                                  opens this full menu.
 

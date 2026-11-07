@@ -149,6 +149,12 @@ pub struct TrayItems {
     pub delete_client: Mutex<HashMap<String, DeleteClientItem>>,
     /// Monotonic counter for delete-client menu ids (reset each rebuild).
     pub delete_client_counter: Mutex<u64>,
+    /// macOS, `window`/`both` mode: the right-button menu, kept here rather
+    /// than on the icon. AppKit opens a status item's menu on EVERY click while
+    /// one is attached, whatever `show_menu_on_left_click` says, so the menu is
+    /// attached only while a right click shows it (see [`pop_context_menu`]).
+    #[cfg(target_os = "macos")]
+    pub detached_menu: Mutex<Option<Menu<Wry>>>,
 }
 
 // ---- public entrypoints (called from main.rs setup) ---------------------
@@ -1499,18 +1505,20 @@ fn on_interface_click(app: &AppHandle, mode: UiMode) {
 
 /// (S13 W-D1) Build the MINIMAL right-click menu used in `ui_mode = "window"`.
 ///
-/// Three items only: reach the popover, re-read the config, leave. This is the
-/// escape hatch of W-D7 — whatever happens to the webview, the user can always
-/// reload their config and quit from the icon. It is deliberately NOT the full
-/// menu: in window mode the full surface lives in the popover, and duplicating
-/// it here would mean maintaining two copies of every checkbox's reconcile
-/// logic.
-fn build_minimal_menu(app: &AppHandle) -> Result<Menu<Wry>, tauri::Error> {
+/// Reach the popover, switch the interface, re-read the config, leave. This is
+/// the escape hatch of W-D7 — whatever happens to the webview, the user can
+/// always get back to the tray menu, reload their config and quit from the
+/// icon. It is deliberately NOT the full menu: in window mode the full surface
+/// lives in the popover, and duplicating it here would mean maintaining two
+/// copies of every checkbox's reconcile logic. The Interface submenu is rebuilt
+/// with the menu on every change, so it needs no reconcile of its own.
+fn build_minimal_menu(app: &AppHandle, state: &AppState) -> Result<Menu<Wry>, tauri::Error> {
     let show = MenuItem::with_id(app, ID_SHOW_WINDOW, "Show window", true, None::<&str>)?;
+    let interface = build_interface_submenu(app, state)?;
     let reload = MenuItem::with_id(app, ID_RELOAD, "Reload config", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, ID_QUIT, "Quit", true, None::<&str>)?;
-    let entries: Vec<&dyn IsMenuItem<Wry>> = vec![&show, &reload, &sep, &quit];
+    let entries: Vec<&dyn IsMenuItem<Wry>> = vec![&show, &interface, &reload, &sep, &quit];
     Menu::with_items(app, &entries)
 }
 
@@ -1532,6 +1540,10 @@ fn build_minimal_menu(app: &AppHandle) -> Result<Menu<Wry>, tauri::Error> {
 /// the webview has already failed to be created this session, `window`/`both`
 /// are treated as `tray` (W-D7) so the user is never left with a button that
 /// does nothing.
+///
+/// macOS differs: AppKit opens a status item's attached menu on ANY click and
+/// ignores `show_menu_on_left_click`, so in `window`/`both` the menu is kept
+/// off the icon and [`on_tray_icon_event`] shows it on a right click.
 pub fn apply_ui_mode(app: &AppHandle, mode: UiMode) {
     let effective = if mode.window_on_left_click() && popover::creation_failed(app) {
         log("tray: popover unavailable this session, forcing tray mode");
@@ -1548,20 +1560,103 @@ pub fn apply_ui_mode(app: &AppHandle, mode: UiMode) {
         log(&format!("tray: set_show_menu_on_left_click failed: {}", e));
     }
 
-    let menu = if effective.full_menu() {
-        app_state(app).and_then(|state| build_menu(app, &state).ok())
-    } else {
-        build_minimal_menu(app).ok()
-    };
-    match menu {
-        Some(m) => {
-            if let Err(e) = tray.set_menu(Some(m)) {
-                log(&format!("tray: set_menu failed: {}", e));
-            }
+    let menu = app_state(app).and_then(|state| {
+        if effective.full_menu() {
+            build_menu(app, &state).ok()
+        } else {
+            build_minimal_menu(app, &state).ok()
         }
-        None => log("tray: could not build the menu for the current ui_mode"),
+    });
+    let Some(menu) = menu else {
+        log("tray: could not build the menu for the current ui_mode");
+        return;
+    };
+
+    #[cfg(target_os = "macos")]
+    let menu = {
+        let detach = effective.window_on_left_click();
+        if let Some(items) = app.try_state::<TrayItems>() {
+            *items.detached_menu.lock() = detach.then(|| menu.clone());
+        }
+        (!detach).then_some(menu)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let menu = Some(menu);
+
+    if let Err(e) = tray.set_menu(menu) {
+        log(&format!("tray: set_menu failed: {}", e));
     }
     log(&format!("tray: ui_mode applied = {}", effective.as_str()));
+}
+
+/// macOS, `window`/`both` mode: show the right-button menu.
+///
+/// The menu is attached to the status item only for the duration of the
+/// click: `show_menu` (`performClick`) runs AppKit's menu tracking loop and
+/// returns once the menu has closed, after which the menu comes off again, so
+/// the next LEFT click reaches the popover instead of opening the menu.
+///
+/// No detached menu means `tray` mode (or the popover-failed fallback): the
+/// menu is on the icon and AppKit has already opened it.
+///
+/// An inactive app is activated first and handed back afterwards. Opening the
+/// menu makes AppKit carry out an activation that is still pending — tao asks
+/// for one at launch, and it stays pending when nobody launched the app by
+/// hand (Start at login) — and that activation closes the menu again within a
+/// third of a second. Measured on macOS 26: without this the first right click
+/// after a login launch flashed the menu and lost it.
+#[cfg(target_os = "macos")]
+fn pop_context_menu(app: &AppHandle, tray: &TrayIcon<Wry>) {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{
+        NSApplication, NSApplicationActivationOptions, NSRunningApplication, NSWorkspace,
+    };
+
+    let menu = app
+        .try_state::<TrayItems>()
+        .and_then(|items| items.detached_menu.lock().clone());
+    let Some(menu) = menu else {
+        return;
+    };
+    // Tray events are delivered from the event loop, on the main thread.
+    let Some(mtm) = MainThreadMarker::new() else {
+        log("tray: right-click menu requested off the main thread");
+        return;
+    };
+    let ns_app = NSApplication::sharedApplication(mtm);
+    let was_active = ns_app.isActive();
+    let previous = if was_active {
+        None
+    } else {
+        NSWorkspace::sharedWorkspace().frontmostApplication()
+    };
+    if !was_active {
+        #[allow(deprecated)]
+        ns_app.activateIgnoringOtherApps(true);
+    }
+
+    if let Err(e) = tray.set_menu(Some(menu)) {
+        log(&format!("tray: set_menu (right click) failed: {}", e));
+    } else {
+        if let Err(e) = tray.with_inner_tray_icon(|t| t.show_menu()) {
+            log(&format!("tray: show_menu failed: {}", e));
+        }
+        if let Err(e) = tray.set_menu(None::<Menu<Wry>>) {
+            log(&format!("tray: detaching the menu failed: {}", e));
+        }
+    }
+
+    // A context menu must not keep the focus away from the app the user was
+    // in, so hand it back ("Show window" activates Patchbay again on its own).
+    // `NSApp.deactivate()` does not do it: measured, Patchbay stayed frontmost.
+    // Activating the previous app does, because Patchbay is the active app now
+    // and may pass activation on.
+    if let Some(previous) = previous {
+        let own_pid = NSRunningApplication::currentApplication().processIdentifier();
+        if previous.processIdentifier() != own_pid {
+            previous.activateWithOptions(NSApplicationActivationOptions::empty());
+        }
+    }
 }
 
 /// (S13 W1) Raw tray-icon events. Only a LEFT button RELEASE in a window-ish
@@ -1582,6 +1677,15 @@ pub fn on_tray_icon_event(tray: &TrayIcon<Wry>, event: TrayIconEvent) {
     else {
         return;
     };
+
+    // macOS: the menu is off the icon in `window`/`both` mode, so the right
+    // button has to open it here (on the press, as a native menu would).
+    #[cfg(target_os = "macos")]
+    if button == MouseButton::Right && button_state == MouseButtonState::Down {
+        pop_context_menu(&tray.app_handle().clone(), tray);
+        return;
+    }
+
     if button != MouseButton::Left || button_state != MouseButtonState::Up {
         return;
     }
@@ -1592,7 +1696,7 @@ pub fn on_tray_icon_event(tray: &TrayIcon<Wry>, event: TrayIconEvent) {
     };
     let mode = state.config.read().ui_mode;
     if !mode.window_on_left_click() {
-        return; // tray mode: Win32 already showed the menu
+        return; // tray mode: the OS already showed the menu
     }
 
     let tray_rect = rect_px(rect);

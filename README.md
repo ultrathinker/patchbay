@@ -58,7 +58,7 @@ off in the Patchbay tray and every connected agent picks it up instantly.
 > **Platforms.** Patchbay runs on **Windows** and on **macOS 11+** (Apple
 > silicon and Intel — one universal build). On Windows it ships as an NSIS
 > installer / exe. On macOS it ships as a signed and notarized
-> `Patchbay_1.4.0_universal.dmg`: open it and drag `Patchbay.app` to
+> `Patchbay_1.4.1_universal.dmg`: open it and drag `Patchbay.app` to
 > Applications. On macOS Patchbay is a menu-bar app — a monochrome icon in the
 > menu bar that follows light/dark mode, and no Dock icon. The tray menu and the
 > popover window work the same on both. Where behaviour differs by OS, this
@@ -154,7 +154,7 @@ setting chooses which one the tray icon drives.
 | `ui_mode` | left-click the icon | right-click the icon |
 |---|---|---|
 | `tray` *(default)* | native menu | native menu |
-| `window` | popover window | small menu: Show window / Reload config / Quit |
+| `window` | popover window | small menu: Show window / Interface / Reload config / Quit |
 | `both` | popover window | native menu |
 
 Switch it in **Settings → Interface** (tray) or on the **Settings** screen

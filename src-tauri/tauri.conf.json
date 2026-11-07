@@ -1,6 +1,6 @@
 {
   "productName": "Patchbay",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "identifier": "dev.patchbay.app",
   "build": {
     "frontendDist": "../dist"
