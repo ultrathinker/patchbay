@@ -7,26 +7,47 @@ with the implementation details an auditor or contributor needs.
 
 Patchbay binds its MCP gateway **strictly to `127.0.0.1:39100`**. It is not
 network-reachable; reaching it requires running code on the local machine as the
-same Windows user. This is the single most important property: most
-"remote attacker" scenarios are out of scope by design.
+same OS user (Windows or macOS). This is the single most important property:
+most "remote attacker" scenarios are out of scope by design.
 
-## Secrets at rest — DPAPI
+## Secrets at rest — DPAPI (Windows) and the login Keychain (macOS)
 
-Sensitive values in `patchbay.json` are encrypted with Windows **DPAPI**, scoped
-to the current user account (`CryptProtectData`):
+Sensitive values in `patchbay.json` are encrypted with the secret store of the
+OS Patchbay runs on, bound to the current user account:
 
 - jack `env` map values,
 - jack `headers` map values (e.g. `Authorization`).
 
-On save, every plaintext sensitive value is encrypted and rewritten with a
-`dpapi:` prefix; re-saving an already-prefixed value is a no-op (no double
-encryption). At use time the values are decrypted in memory and passed to the
-spawned child / HTTP request. **Plaintext secrets are never persisted to disk**
-by Patchbay after the first save.
+The platform-neutral facade is `utils/secret_store.rs`; each encrypted value
+carries a prefix that says how to open it.
+
+| OS | Mechanism | Stored as |
+|---|---|---|
+| Windows | **DPAPI**, CurrentUser scope (`CryptProtectData`) | `dpapi:<base64>` |
+| macOS | **AES-256-GCM** with a random 256-bit key kept in the user's login Keychain (generic password, service `dev.patchbay.app`, account `config-encryption-key`) | `keychain:<base64(nonce‖ciphertext)>` |
+
+On save, every plaintext sensitive value is encrypted and rewritten with the
+platform's prefix; re-saving a value that already carries **either** prefix is a
+no-op (no double encryption). At use time the values are decrypted in memory and
+passed to the spawned child / HTTP request. **Plaintext secrets are never
+persisted to disk** by Patchbay after the first save.
+
+On macOS the Keychain key is created **only if the Keychain item does not
+exist**. If Keychain access fails (access denied, Keychain locked), Patchbay
+reports the error and does **not** make a new key — a new key would orphan every
+secret already sealed under the old one.
+
+Threat model: equivalent to DPAPI. Any process running as the same user could
+ask the OS for the DPAPI-protected data or the Keychain key, so this does not
+defend against hostile code running as you. What it does give you is that a
+copied `patchbay.json` — a backup, a synced folder, another machine — is useless
+without your account's DPAPI keys or your Keychain.
 
 Consequence: a `patchbay.json` copied to another user account or machine cannot
-be decrypted there. Back up the config together with the user profile, or
-re-enter secrets after restore.
+be decrypted there. A value encrypted on the *other* OS (a config copied between
+a Windows and a macOS machine) cannot be opened either: it decrypts to an empty
+value and the log says to re-enter it. Back up the config together with the user
+profile (on macOS, with the Keychain), or re-enter secrets after restore.
 
 ## Agent identity & permissions
 
@@ -44,8 +65,10 @@ machine is assumed trusted at the OS level; the identity layer is for
 On top of identity:
 
 - **Approval gate** (off by default): the first time a *never-seen* identity
-  connects, a Win32 Allow/Deny dialog blocks `initialize` until you decide.
-  Allow remembers it; Deny adds it to the Forbidden list. The gate **fails
+  connects, a native Allow/Deny dialog blocks `initialize` until you decide —
+  `MessageBoxW` on Windows, an AppleScript `display dialog` run by
+  `/usr/bin/osascript` on macOS. Allow remembers it; Deny adds it to the
+  Forbidden list. The gate **fails
   closed** — a client that sends neither `X-Patchbay-Client` nor
   `clientInfo.name` is rejected outright (such a client can never match the
   Forbidden list, so it cannot be allowed to slip through with default-global
@@ -75,25 +98,42 @@ Treat all logs as potentially sensitive and redact before sharing regardless.
 ## Child processes
 
 Upstream stdio jacks are spawned as children of Patchbay (running with your user
-privileges) and attached to a Windows **Job Object**. Quitting Patchbay or
-unpatching a jack cannot leave orphaned processes behind — the OS reaps them.
+privileges), and Patchbay makes sure they do not outlive it:
+
+- **Windows** — each child is attached to a **Job Object** with
+  `KILL_ON_JOB_CLOSE`. Quitting Patchbay or unpatching a jack cannot leave
+  orphaned processes behind — the OS reaps the whole tree (cmd → npx → node),
+  even if Patchbay crashes or is killed.
+- **macOS** — each child leads its **own process group**. Unpatching a jack kills
+  the whole group (e.g. `npx` and the `node` it started); quitting Patchbay —
+  tray Quit, window Quit, logout, or SIGTERM / SIGINT / SIGHUP — kills
+  every group. **Limitation:** there is no OS-level kill-on-crash on macOS. If
+  Patchbay itself is force-killed (SIGKILL) or crashes, nothing reaps the
+  children; they see EOF on stdin, which ends a well-behaved MCP server but is
+  not guaranteed.
+
 Patchbay does **not** sandbox upstream MCP servers; choose jacks the way you'd
-choose any other tool that runs code on your machine.
+choose any other tool that runs code on your machine. On macOS Patchbay also
+imports your login shell's `PATH` at startup (`$SHELL -l -i -c`, 5 s timeout) so
+that commands like `npx` resolve; this means your shell profile is executed
+once at startup, with your privileges, exactly as opening a terminal would.
 
 ## The window UI (S13) — untrusted strings in a webview
 
 Since 1.3.0 Patchbay can optionally show a popover **window** (`ui_mode` =
 `window` or `both`; the default `tray` creates no window at all). The window is
-a local WebView2 that loads only assets embedded in the binary, under the strict
-CSP declared in `tauri.conf.json` — no CDN, no remote origin, no network fetch.
+a local webview (WebView2 on Windows, the system WKWebView on macOS) that loads
+only assets embedded in the binary, under the strict CSP declared in
+`tauri.conf.json` — no CDN, no remote origin, no network fetch.
 
 That introduces one threat the native menu did not have, and it is worth stating
 plainly because it is easy to get wrong.
 
 **Agent identity is attacker-controlled text.** As described above, the
 `X-Patchbay-Client` header and `clientInfo.name` are self-reported and
-unauthenticated. In the tray menu those strings are handed to Win32
-(`AppendMenuW`), which treats them as text and nothing else. In a webview the
+unauthenticated. In the tray menu those strings are handed to the OS's native
+menu (Win32 `AppendMenuW` on Windows), which treats them as text and nothing
+else. In a webview the
 same string is markup: an agent that names itself with an HTML fragment carrying
 an event handler would be executing script inside the UI. Because the Tauri IPC
 bridge is reachable from the page, script in the page can call the commands the
@@ -107,6 +147,9 @@ Patchbay defends this in four independent layers, so no single mistake is fatal:
 1. **Sanitized at the source.** A client name is restricted to a safe display
    character set and length-capped when it is recorded; the raw bytes never
    reach a renderer. This also protects the tray label and the log file.
+   (On macOS there is a second interpreter for this text: the approval and
+   delete-agent dialogs are built as AppleScript, so the identity is escaped
+   there as well — see below.)
 2. **Escaped by construction.** The frontend sets text as text. `innerHTML`,
    `dangerouslySetInnerHTML` and `insertAdjacentHTML` are banned in `dist/`, and
    a CI check fails the build if one appears.
@@ -120,10 +163,30 @@ client version, upstream error text, jack status, and config-error text.
 
 **Secrets never reach the frontend.** The snapshot the window renders carries
 names, flags, counts and statuses only — no `env` values, no headers, no URL
-credentials, not even the DPAPI-encrypted forms. Secrets travel in one direction
-only: they may be typed into the "Add server" form and sent once to the backend,
-which persists them DPAPI-encrypted. They are never sent back, so an existing
-jack's secret cannot be read out of the UI.
+credentials, not even the encrypted forms (`dpapi:` / `keychain:`). Secrets
+travel in one direction only: they may be typed into the "Add server" form and
+sent once to the backend, which persists them encrypted. They are never sent
+back, so an existing jack's secret cannot be read out of the UI.
+
+## Native dialogs — the identity string and AppleScript (macOS)
+
+The approval dialog and the "delete agent" confirmation show the agent's
+identity, which is attacker-controlled text (see above). On Windows it is passed
+to `MessageBoxW` as a plain wide string. On macOS the dialogs are AppleScript
+`display dialog` calls run through `/usr/bin/osascript`, which would make the
+identity a string literal inside a script — a quote or backslash in a crafted
+name could otherwise break out of the literal and add AppleScript of its own.
+So the identity is **escaped for AppleScript** before it is placed in the
+script: backslashes and double quotes are escaped, control characters are
+dropped, and line breaks become `& return &`, so nothing in the name can end the
+string literal. (This sits on top of the source-level sanitizing above; neither
+layer is relied on alone.)
+
+Both dialogs run on a plain thread, never on the async runtime or the UI thread,
+and fail safe: dismissing the dialog, pressing Escape, or a failure to show it
+counts as **Deny** for the approval gate and as **Cancel** for deletion — and the
+delete confirmation's default button is Cancel, so a stray Return deletes
+nothing.
 
 ## Who may switch a server on (S14)
 
@@ -169,7 +232,7 @@ revisiting, but not by widening a rule about granting.
 
 ## Where the secrets live, and what else shares the file (S14)
 
-`patchbay.json` holds every server definition and every DPAPI-encrypted secret.
+`patchbay.json` holds every server definition and every encrypted secret.
 It used to hold the list of agents that had connected as well — which meant
 ordinary agent traffic rewrote it: an agent connecting appended to the list, and
 a `last_seen` timestamp was refreshed roughly once a minute per active agent.

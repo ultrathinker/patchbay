@@ -122,6 +122,12 @@ impl StdioClient {
         {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
+        // Unix: lead a process group of its own, so stopping the jack can kill
+        // everything it started (npx -> node) — see `process::kill_tree`.
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -449,6 +455,11 @@ impl StdioClient {
         {
             let mut guard = self.child.lock().await;
             if let Some(mut child) = guard.take() {
+                // The whole process group first, while the child is un-reaped
+                // (its pid cannot have been recycled yet). No-op on Windows.
+                if let Some(pid) = child.id() {
+                    super::process::kill_tree(pid);
+                }
                 let _ = child.kill().await;
                 let _ = child.wait().await;
             }

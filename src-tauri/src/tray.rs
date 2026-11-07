@@ -59,6 +59,12 @@ const ID_MODE_BOTH: &str = "mode_both";
 /// default text editor via the same pattern as [`on_open_config`].
 const ABOUT_TEXT: &str = include_str!("../../ABOUT.txt");
 
+/// The autostart menu item: each OS has its own words for it.
+#[cfg(target_os = "macos")]
+const AUTOSTART_LABEL: &str = "Start at login";
+#[cfg(not(target_os = "macos"))]
+const AUTOSTART_LABEL: &str = "Start with Windows";
+
 /// One per-client-per-jack override checkbox (S10). Carries the opaque muda
 /// menu item plus the (client, jack) it represents, so a click on an opaque id
 /// can be resolved back to its meaning via the [`TrayItems::overrides`] lookup
@@ -202,7 +208,7 @@ pub fn build_menu(app: &AppHandle, state: &AppState) -> Result<Menu<Wry>, tauri:
     let autostart_item = CheckMenuItem::with_id(
         app,
         ID_AUTOSTART,
-        "Start with Windows",
+        AUTOSTART_LABEL,
         true,
         autostart,
         None::<&str>,
@@ -1095,10 +1101,32 @@ fn open_text_file(path: &std::path::Path, log_tag: &str) {
             }
         }
     }
-    #[cfg(not(windows))]
+    // macOS: `open -t` opens the file in the default text editor (TextEdit
+    // unless the user picked another), regardless of the .json association.
+    #[cfg(target_os = "macos")]
     {
+        mac_open(&["-t", &path_str], log_tag);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = log_tag;
         let _ = std::process::Command::new("xdg-open").arg(&path_str).spawn();
     }
+}
+
+/// Run `/usr/bin/open <args>` on a helper thread and reap it (a spawned but
+/// never-waited child would linger as a zombie for the life of the tray app).
+#[cfg(target_os = "macos")]
+fn mac_open(args: &[&str], log_tag: &str) {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let log_tag = log_tag.to_string();
+    std::thread::spawn(move || {
+        match std::process::Command::new("/usr/bin/open").args(&args).status() {
+            Ok(st) if st.success() => {}
+            Ok(st) => log(&format!("tray: open {log_tag} exited with {st}")),
+            Err(e) => log(&format!("tray: open {log_tag} failed: {e}")),
+        }
+    });
 }
 
 /// Open a FOLDER in the OS file manager. On Windows, launches `explorer.exe
@@ -1116,7 +1144,11 @@ fn open_folder_in_explorer(path: &std::path::Path) {
             .creation_flags(CREATE_NO_WINDOW)
             .spawn();
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        mac_open(&[&path_str], "folder");
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = std::process::Command::new("xdg-open").arg(&path_str).spawn();
     }
@@ -1386,8 +1418,10 @@ fn on_delete_client_click(app: &AppHandle, id: &str) {
     });
 }
 
-/// "Quit": log + exit. The process-wide Job Object (KILL_ON_JOB_CLOSE) reaps
-/// any stdio children on exit, so a hard exit leaves zero orphans.
+/// "Quit": log + exit. On Windows the process-wide Job Object
+/// (KILL_ON_JOB_CLOSE) reaps any stdio children on exit; on macOS/Unix their
+/// process groups are killed explicitly first. Either way a hard exit leaves
+/// zero orphans.
 fn on_quit(app: &AppHandle) {
     log("tray: Quit requested");
     // Record the stop to the Level-2 request log (synchronous write completes
@@ -1395,6 +1429,7 @@ fn on_quit(app: &AppHandle) {
     if let Some(state) = app_state(app) {
         crate::utils::request_log::log_event(&state, "app_stop");
     }
+    crate::upstream::process::kill_all();
     std::process::exit(0);
 }
 
@@ -1560,16 +1595,7 @@ pub fn on_tray_icon_event(tray: &TrayIcon<Wry>, event: TrayIconEvent) {
         return; // tray mode: Win32 already showed the menu
     }
 
-    // Physical pixels: the tray rect and the monitor work area must be in the
-    // same space as the position we hand back to the window.
-    let pos = rect.position.to_physical::<i32>(1.0);
-    let size = rect.size.to_physical::<u32>(1.0);
-    let tray_rect = RectPx {
-        x: pos.x,
-        y: pos.y,
-        w: size.width as i32,
-        h: size.height as i32,
-    };
+    let tray_rect = rect_px(rect);
 
     if !popover::toggle_popover(&app, tray_rect) {
         // The webview is unavailable — fall back to the native menu for this
@@ -1578,22 +1604,51 @@ pub fn on_tray_icon_event(tray: &TrayIcon<Wry>, event: TrayIconEvent) {
     }
 }
 
+/// A tray-icon rectangle in physical pixels: the tray rect and the monitor
+/// work area must be in the same space as the position we hand back to the
+/// window.
+fn rect_px(rect: tauri::Rect) -> RectPx {
+    let pos = rect.position.to_physical::<i32>(1.0);
+    let size = rect.size.to_physical::<u32>(1.0);
+    RectPx {
+        x: pos.x,
+        y: pos.y,
+        w: size.width as i32,
+        h: size.height as i32,
+    }
+}
+
 /// "Show window" in the minimal menu.
 fn on_show_window(app: &AppHandle) {
+    if !show_window_anywhere(app) && popover::creation_failed(app) {
+        apply_ui_mode(app, UiMode::Tray);
+    }
+}
+
+/// Show the popover without a click on the icon: "Show window" in the minimal
+/// menu, a second launch of the app, or macOS "reopen" (the user opened
+/// Patchbay again from Finder, Spotlight or Launchpad while it was running —
+/// the only way back to it when the menu bar has no room for its icon).
+///
+/// Anchors to the icon rectangle of the last click, else asks the tray icon
+/// where it is. Returns `false` when there is no anchor or no window.
+pub fn show_window_anywhere(app: &AppHandle) -> bool {
     let rect = app
         .try_state::<popover::PopoverState>()
-        .and_then(|s| *s.tray_rect.lock());
+        .and_then(|s| *s.tray_rect.lock())
+        .or_else(|| {
+            get_tray(app)
+                .and_then(|t| t.rect().ok().flatten())
+                .map(rect_px)
+        });
     match rect {
-        Some(r) => {
-            if !popover::show_popover(app, r) {
-                apply_ui_mode(app, UiMode::Tray);
-            }
-        }
-        // No tray event has been seen yet this session (the user opened the
-        // menu with the keyboard, say), so there is no icon rectangle to anchor
-        // to. Nothing sane to position against — say so rather than guessing at
+        Some(r) => popover::show_popover(app, r),
+        // Nothing sane to position against — say so rather than guessing at
         // (0,0).
-        None => log("tray: Show window requested before any tray click; no anchor rect yet"),
+        None => {
+            log("tray: show window requested but the tray icon position is unknown");
+            false
+        }
     }
 }
 

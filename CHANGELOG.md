@@ -7,6 +7,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-11-07
+
+Patchbay now runs on macOS as well as Windows. The gateway, the jacks, the
+permissions and both interfaces behave the same on the two systems; what had to
+change is everything that touched the operating system — where secrets are kept,
+how child processes are cleaned up, how the app starts at login, and how
+dialogs are shown. Windows is unchanged (NSIS installer / exe, DPAPI, Job
+Object, Run key).
+
+### Added
+- **macOS 11+ support, Apple silicon and Intel.** One universal build, shipped
+  as a signed and notarized `Patchbay_1.4.0_universal.dmg` — open it and drag
+  `Patchbay.app` to Applications. On macOS Patchbay is a menu-bar app: a
+  monochrome template icon that follows light and dark mode, and no Dock icon.
+  The tray menu and the popover window work the same as on Windows; the window
+  uses the system WKWebView, so there is no WebView2 to install.
+- **Secrets are encrypted on macOS too, with a key in your login Keychain.**
+  DPAPI does not exist on macOS, so without this the tokens and env vars in
+  `patchbay.json` would sit there as plaintext. A random 256-bit key is kept in
+  the login Keychain (generic password, service `dev.patchbay.app`, account
+  `config-encryption-key`) and each secret is sealed with AES-256-GCM under it,
+  stored as `keychain:<base64(nonce||ciphertext)>`. The rules match Windows:
+  type plaintext and it is encrypted on the next save, already-encrypted values
+  (either prefix) are never re-encrypted, and a copied config or backup is
+  useless without the Keychain. A value encrypted on the *other* OS (a config
+  copied between machines) cannot be opened — it decrypts to empty and the log
+  says to re-enter it. The key is created only when the Keychain item does not
+  exist; if Keychain access fails, Patchbay never makes a new key, because that
+  would orphan every secret already stored.
+- **Start at login on macOS.** The tray item is called "Start at login" there
+  (still "Start with Windows" on Windows). It writes a LaunchAgent,
+  `~/Library/LaunchAgents/dev.patchbay.app.plist`, which takes effect from the
+  next login and shows up in System Settings > General > Login Items. Turning
+  it off removes the plist.
+- **No orphaned MCP servers on macOS.** Windows has a Job Object that makes the
+  OS kill every child when Patchbay goes away; macOS has no such thing, so each
+  stdio child now leads its own process group. Switching a jack off kills the
+  whole group (for example `npx` and the `node` it started), and quitting
+  Patchbay — tray Quit, window Quit, logging out, or SIGTERM / SIGINT /
+  SIGHUP — kills every group. The limit: if Patchbay itself is force-killed
+  (SIGKILL) or crashes, macOS gives no OS-level guarantee; the children see EOF
+  on stdin, which ends a well-behaved MCP server.
+- **Native approval and delete-agent dialogs on macOS.** An AppleScript
+  `display dialog` run through `/usr/bin/osascript`, in place of the Windows
+  `MessageBox`. Delete defaults to Cancel, so a stray Return removes nothing.
+  The agent name shown in the dialog is untrusted input, so it is escaped for
+  AppleScript before it is placed in the script.
+- **Your terminal's `PATH` on macOS.** An app started from Finder or at login
+  gets a minimal `PATH`, so a jack whose `command` is `npx`, `node`, `uvx` or
+  `docker` would fail to start even though it works in a terminal. At startup
+  Patchbay now asks your login shell (`$SHELL -l -i -c`, 5 s timeout) for its
+  `PATH` and adds `/opt/homebrew/bin`, `/opt/homebrew/sbin`, `/usr/local/bin`,
+  `~/.local/bin`, `~/.cargo/bin`, `~/.bun/bin` and `~/.volta/bin`.
+- **Launching Patchbay again opens the window (both platforms).** Starting it
+  while it is already running (Start menu, Finder, Spotlight; on macOS also the
+  system "reopen") used to do nothing visible. It now opens the popover window at
+  the tray icon, so there is always a way back to the app — including when the
+  menu bar has no room for its icon. "Show window" also works before the icon
+  was ever clicked.
+- CI builds and tests on both `windows-latest` and `macos-latest`.
+
+### Changed
+- **Where things live on macOS.** Config, state and logs are in
+  `~/Library/Application Support/Patchbay/` (`patchbay.json`,
+  `patchbay.state.json`, `patchbay.example.jsonc`, `logs/`) instead of
+  `%APPDATA%\Patchbay\`, which stays as it was on Windows.
+- **"Open config file" and "Open logs folder"** use the default text editor
+  (`open -t`) and Finder on macOS; Notepad and Explorer on Windows, as before.
+- **Secret handling goes through a platform-neutral layer**
+  (`utils/secret_store.rs`) that picks DPAPI or the Keychain and recognises both
+  `dpapi:` and `keychain:` as "already encrypted". The Windows format on disk is
+  unchanged.
+- **Building from source.** The Tauri CLI is run through npx, so `cargo tauri`
+  no longer needs to be installed:
+  `npx @tauri-apps/cli@2 build` for the Windows NSIS installer, and
+  `npx @tauri-apps/cli@2 build --bundles app` for the macOS app bundle (add
+  `--target universal-apple-darwin` for the universal build).
+- **Documentation.** The README's "Windows-only" note is replaced by a
+  "Platforms" note and the platform badge now reads Windows | macOS; README,
+  `ABOUT.txt`, `docs/architecture.md`, `docs/security.md` and the commented
+  example config describe both platforms.
+
+### Fixed
+- **Starting Patchbay a second time hid the running copy's log.** The second
+  process started its logger before it noticed Patchbay was already running, and
+  that rotated `patchbay_rCURRENT.log` away: the running copy went on writing to
+  the renamed file, so "Open logs folder" showed a one-line log. The logger now
+  starts only in the copy that keeps running. (Launching again is now how you
+  open the window, so this would have happened often.)
+- `ABOUT.txt` (the tray "About" text) said the popover window closes when you
+  click away from it. That stopped being true in 1.3.4; it now lists the ways it
+  does close — the X button, the tray icon again, or Esc.
+
 ## [1.3.7] — 2026-10-31
 
 ### Fixed
@@ -366,7 +459,8 @@ two-tier logging) and the subsequent security hardening.
   sensitive JSON keys inside logged request params (e.g. a jack's `headers`/`env`
   passed to `patchbay__add_jack`), which header redaction alone could not cover.
 
-[Unreleased]: https://github.com/ultrathinker/patchbay/compare/v1.2.13...HEAD
+[Unreleased]: https://github.com/ultrathinker/patchbay/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/ultrathinker/patchbay/releases/tag/v1.4.0
 [1.2.13]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.13
 [1.2.12]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.12
 [1.2.11]: https://github.com/ultrathinker/patchbay/releases/tag/v1.2.11

@@ -44,7 +44,7 @@ pub struct PatchbayConfig {
     #[serde(default = "default_port")]
     pub port: u16,
 
-    /// Start Patchbay with Windows (HKCU `Run\Patchbay`).
+    /// Start Patchbay at login (Windows: HKCU `Run\Patchbay`; macOS: a LaunchAgent).
     #[serde(default)]
     pub autostart: bool,
 

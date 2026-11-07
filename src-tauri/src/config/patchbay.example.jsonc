@@ -7,12 +7,18 @@
 //
 // Secrets
 // -------
-// Any `env` / `headers` value that does NOT start with "dpapi:" is treated as
-// PLAINTEXT and is automatically encrypted (rewritten as "dpapi:<base64>") the
-// next time Patchbay saves the config — for example when you toggle a jack in
-// the tray. So to add a secret, just type its plaintext value here and toggle a
-// jack once; it will be encrypted on disk afterwards. Only the same Windows
-// user can decrypt it (Windows DPAPI, CurrentUser scope).
+// Any `env` / `headers` value that does NOT start with "dpapi:" or "keychain:"
+// is treated as PLAINTEXT and is automatically encrypted the next time Patchbay
+// saves the config — for example when you toggle a jack in the tray. So to add
+// a secret, just type its plaintext value here and toggle a jack once; it will
+// be encrypted on disk afterwards. Already-encrypted values are never
+// re-encrypted.
+//   Windows: rewritten as "dpapi:<base64>" (Windows DPAPI, CurrentUser scope);
+//            only the same Windows user can decrypt it.
+//   macOS:   rewritten as "keychain:<base64>" (AES-256-GCM, the key lives in
+//            your login Keychain); only your user + Keychain can decrypt it.
+// A value encrypted on the other OS (config copied between machines) can't be
+// opened: it reads as empty and the log says to re-enter it.
 //
 // Names
 // -----
@@ -22,7 +28,7 @@
 {
   "version": 1,                 // schema version
   "port": 39100,                // gateway port, bound strictly to 127.0.0.1
-  "autostart": false,           // start Patchbay with Windows (HKCU Run)
+  "autostart": false,           // start at login: Windows HKCU Run key / macOS LaunchAgent
   "jacks": [
     {
       "name": "prod",           // [A-Za-z0-9_-]+, no "__", <= 40 chars, unique

@@ -1,7 +1,7 @@
 # Contributing to Patchbay
 
-Thanks for your interest in Patchbay! This project is a Windows-only Rust/Tauri
-v2 system-tray app, so a few things are specific to that stack.
+Thanks for your interest in Patchbay! This project is a Rust/Tauri v2
+system-tray app for Windows and macOS, so a few things are specific to that stack.
 
 ## Reporting issues
 
@@ -34,11 +34,12 @@ cargo test
 # Optimized release binary
 cargo build --release
 
-# Windows NSIS installer (needs the Tauri prerequisites)
-cargo tauri build
+# Installer / app bundle via the Tauri CLI (needs the Tauri prerequisites)
+npx @tauri-apps/cli@2 build                    # Windows: NSIS installer
+npx @tauri-apps/cli@2 build --bundles app      # macOS: Patchbay.app
 ```
 
-The helpers wrap the MSVC environment setup:
+On Windows the helpers wrap the MSVC environment setup:
 
 ```powershell
 powershell -File _test.ps1     # cargo test (debug)
@@ -53,7 +54,8 @@ powershell -File _build.ps1 -Release
   (`utils/log.rs`) — prefer it over `println!`/`eprintln!` for anything that is
   not a bootstrap fallback.
 - No new secrets, tokens or personal data in source, configs, tests or logs.
-  Secrets live in `patchbay.json` and are DPAPI-encrypted by the app itself.
+  Secrets live in `patchbay.json` and are encrypted by the app itself (DPAPI on
+  Windows, a Keychain-held key on macOS).
 - Keep commits focused and write clear messages.
 
 ## Pull request process
@@ -68,7 +70,7 @@ powershell -File _build.ps1 -Release
 
 ## Scope
 
-Patchbay intentionally stays small and Windows-focused. Features that would
+Patchbay intentionally stays small and desktop-focused (Windows and macOS). Features that would
 require a visible window, a network listener beyond `127.0.0.1`, or a generic
 MCP SDK (e.g. `rmcp`) are out of scope by design. If in doubt, open an issue to
 discuss before starting work.

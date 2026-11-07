@@ -30,8 +30,9 @@ boundaries are helps you report and assess issues accurately:
   not reachable from the network. Any issue that assumes remote reachability is
   out of the threat model.
 - **Secrets at rest.** API keys, bearer tokens and sensitive environment
-  variables in `patchbay.json` are encrypted with Windows **DPAPI**, tied to the
-  running Windows user account, at save time. Plaintext secrets are never
+  variables in `patchbay.json` are encrypted at save time, tied to the running
+  user account: Windows **DPAPI** on Windows, AES-256-GCM with a key held in the
+  login **Keychain** on macOS. Plaintext secrets are never
   persisted to disk by Patchbay.
 - **Upstream MCP servers ("jacks").** Patchbay spawns and proxies to upstream
   MCP servers *you* configure. Those servers run with your user privileges and

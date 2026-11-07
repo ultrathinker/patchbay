@@ -6,12 +6,12 @@
 ![CI](https://github.com/ultrathinker/patchbay/actions/workflows/ci.yml/badge.svg)
 ![Rust](https://img.shields.io/badge/rust-stable-orange)
 ![Tauri](https://img.shields.io/badge/Tauri-v2-blue)
-![Platform](https://img.shields.io/badge/platform-Windows-blue)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue)
 
-Patchbay is a Windows system-tray app + a local **MCP gateway** that lets you
-toggle MCP servers on/off from the tray — **live, for ALL your CLI coding agents
-at once** (Claude Code, Codex, Antigravity, Kilo), with no agent restart and no
-per-agent config edits after a one-time wiring.
+Patchbay is a system-tray app (a menu-bar app on macOS) + a local **MCP
+gateway** that lets you toggle MCP servers on/off from the tray — **live, for
+ALL your CLI coding agents at once** (Claude Code, Codex, Antigravity, Kilo),
+with no agent restart and no per-agent config edits after a one-time wiring.
 
 It speaks the [Model Context Protocol](https://modelcontextprotocol.io) over
 Streamable HTTP on `http://127.0.0.1:39100/mcp` (bound strictly to localhost).
@@ -31,7 +31,7 @@ off in the Patchbay tray and every connected agent picks it up instantly.
   and a work profile of the same tool apart.
 - **Per-agent permissions.** Give any agent its own independent on/off list
   ("Custom permissions"), separate from the global checkboxes.
-- **Approval gate.** Optionally require a one-time Allow/Deny Windows dialog the
+- **Approval gate.** Optionally require a one-time Allow/Deny system dialog the
   first time a brand-new identity connects (off by default).
 - **Honest errors.** Calling an unpatched server returns a clear message to the
   agent instead of a mystery failure. A Patchbay restart invalidates every
@@ -43,18 +43,26 @@ off in the Patchbay tray and every connected agent picks it up instantly.
   `patchbay__remove_jack`, `patchbay__list_jacks`, `patchbay__toggle_jack` let a
   connected agent add/remove/flip servers without you touching the config file.
 - **Secrets encrypted at rest.** API keys, bearer tokens and env vars are
-  DPAPI-encrypted (tied to your Windows user account) the moment they're saved —
-  no master password, no plaintext on disk.
+  encrypted the moment they're saved — with DPAPI (tied to your Windows user
+  account) on Windows, or with a random key kept in your login Keychain on macOS
+  — no master password, no plaintext on disk.
 - **Two-tier logging.** An always-on diagnostic log, plus an opt-in request/event
   log that records every MCP request and admin action with secrets redacted.
 - **Local only.** Bound strictly to `127.0.0.1`; no network exposure. The
   optional window UI (below) is a local webview that loads only embedded assets
-  under a strict CSP. Spawned child processes are tied to a Windows Job Object so quitting
-  Patchbay can never leave orphans behind.
+  under a strict CSP. Spawned child processes never outlive a quit: on Windows
+  they are tied to a Job Object (the OS kills them even if Patchbay crashes); on
+  macOS each one runs in its own process group that Patchbay kills when you
+  switch the jack off or quit.
 
-> **Windows-only.** Patchbay uses Windows DPAPI, the registry (autostart), Job
-> Objects and the tray, so it targets Windows. The gateway protocol itself is
-> cross-platform MCP, but the host side is not.
+> **Platforms.** Patchbay runs on **Windows** and on **macOS 11+** (Apple
+> silicon and Intel — one universal build). On Windows it ships as an NSIS
+> installer / exe. On macOS it ships as a signed and notarized
+> `Patchbay_1.4.0_universal.dmg`: open it and drag `Patchbay.app` to
+> Applications. On macOS Patchbay is a menu-bar app — a monochrome icon in the
+> menu bar that follows light/dark mode, and no Dock icon. The tray menu and the
+> popover window work the same on both. Where behaviour differs by OS, this
+> document says so.
 
 ## Vocabulary
 
@@ -78,7 +86,9 @@ After this, **never** edit agent configs again; toggle servers in Patchbay.
 
 ## 2. Configuring servers (jacks)
 
-Edit the config file at `%APPDATA%\Patchbay\patchbay.json`. A fully commented
+Edit the config file at `%APPDATA%\Patchbay\patchbay.json` on Windows, or
+`~/Library/Application Support/Patchbay/patchbay.json` on macOS (the tray's
+**Open config file** opens it for you). A fully commented
 `patchbay.example.jsonc` is written next to it on first run for reference. Each
 jack is either **stdio** (a local command) or **streamable-http** (a remote URL):
 
@@ -111,13 +121,27 @@ jack is either **stdio** (a local command) or **streamable-http** (a remote URL)
 
 After editing, click **Reload config** in the tray.
 
-- **Secrets**: type them in **plaintext**; Patchbay DPAPI-encrypts them to a
-  `dpapi:`-prefixed value on the next save, so only your Windows user account
-  can ever decrypt them. The config on disk never keeps plaintext secrets.
+- **Secrets**: type them in **plaintext**; Patchbay encrypts them on the next
+  save, so the config on disk never keeps plaintext secrets. Values that are
+  already encrypted are never re-encrypted.
+  - **Windows**: DPAPI (CurrentUser scope), stored as `dpapi:<base64>` — only
+    your Windows user account can decrypt them.
+  - **macOS**: AES-256-GCM with a random 256-bit key kept in your login Keychain
+    (generic password, service `dev.patchbay.app`, account
+    `config-encryption-key`), stored as `keychain:<base64>`. A copied config or
+    backup is useless without that Keychain item.
+  - A value encrypted on the *other* OS (a config copied between machines)
+    cannot be opened: it decrypts to empty and the log says to re-enter it.
 - **`prod` ships unpatched** (`patched: false`) — opt in explicitly.
 - **Windows note**: a `command` like `npx` or `npm` works out of the box —
   Patchbay runs bare commands through `cmd /C` so the `.cmd` launchers npm
   installs on Windows resolve correctly.
+- **macOS note**: an app started from Finder or at login gets a minimal `PATH`,
+  so at startup Patchbay asks your login shell (`$SHELL -l -i -c`, 5 s timeout)
+  for its `PATH` and adds `/opt/homebrew/bin`, `/opt/homebrew/sbin`,
+  `/usr/local/bin`, `~/.local/bin`, `~/.cargo/bin`, `~/.bun/bin` and
+  `~/.volta/bin`. A `command` like `npx`, `node`, `uvx` or `docker` therefore
+  resolves as it does in your terminal.
 
 Each jack's tools are exposed to agents as `<jack>__<tool>`
 (e.g. `github__create_issue`).
@@ -136,7 +160,7 @@ setting chooses which one the tray icon drives.
 Switch it in **Settings → Interface** (tray) or on the **Settings** screen
 (window). The default is `tray`, so upgrading changes nothing until you opt in.
 
-**Why a window exists.** A Windows menu closes the moment you click anything in
+**Why a window exists.** A tray menu closes the moment you click anything in
 it. That is fine for a single blind toggle you already know the position of, and
 poor for everything else: you cannot see whether a checkbox actually moved, a
 server that takes a second to start has nowhere to report "starting…" or
@@ -161,9 +185,17 @@ upper limit on either.
   logging, and the config/log folders.
 
 The window is created the first time you open it, so `tray` users never pay for
-it. It needs the WebView2 runtime (present on Windows 11 and current Windows
-10); if it cannot start, Patchbay logs why and falls back to the tray menu for
-that session without changing your setting.
+it. On Windows it needs the WebView2 runtime (present on Windows 11 and current
+Windows 10); on macOS it uses the system WKWebView, so there is nothing to
+install. If it cannot start, Patchbay logs why and falls back to the tray menu
+for that session without changing your setting.
+
+**Launching Patchbay again opens the window.** Starting Patchbay while it is
+already running (Start menu, Finder, Spotlight; on macOS also the system
+"reopen") opens the popover window at the tray icon instead of doing nothing —
+so there is always a way back to it, even when the icon is not visible (on
+macOS, when the menu bar has no room for it).
+**Show window** also works before the icon has ever been clicked.
 
 ## Tray menu
 
@@ -174,12 +206,18 @@ that session without changing your setting.
   shows `GATEWAY FAILED`, e.g. because port 39100 was in use at startup and has
   since freed up).
 - **Reload config** — re-reads `patchbay.json` and reconciles jacks.
-- **Open config file** / **Copy gateway URL** — convenience helpers.
-- **Open logs folder** — opens the folder holding Patchbay's log files.
+- **Open config file** / **Copy gateway URL** — convenience helpers. The config
+  file opens in Notepad on Windows and in your default text editor on macOS.
+- **Open logs folder** — opens the folder holding Patchbay's log files (in
+  Explorer on Windows, Finder on macOS).
 - **Enable request logging** (in the Settings submenu) — toggles a second-tier log that records each MCP request/response with secrets redacted; off by default.
 - **Interface** (in the Settings submenu) — chooses between the tray menu, the
   popover window, or both. See above.
-- **Start with Windows** — toggles autostart.
+- **Start with Windows** (on macOS: **Start at login**) — toggles autostart. On
+  Windows this sets the `Patchbay` value in the HKCU `Run` key. On macOS it
+  writes a LaunchAgent, `~/Library/LaunchAgents/dev.patchbay.app.plist`, that
+  runs the app at login; it takes effect from your next login and shows up in
+  System Settings → General → Login Items. Turning it off removes the plist.
 - **Quit**.
 
 The tray tooltip shows the patched/total counts and the gateway URL, or a
@@ -200,13 +238,22 @@ distinct `Patchbay — GATEWAY FAILED: <reason>` when the port couldn't be bound
   directly and cannot be routed through Patchbay.
 - **Unpatch = no NEW reachability.** New calls are blocked instantly and a stdio
   child is killed; an already-in-flight remote HTTP request is best-effort.
+- **macOS: no kill-on-crash guarantee.** Switching a jack off kills its whole
+  process group (e.g. `npx` and the `node` it started), and quitting Patchbay —
+  tray Quit, window Quit, logout, or SIGTERM / SIGINT / SIGHUP — kills
+  every group. But if Patchbay itself is force-killed (SIGKILL) or crashes,
+  macOS gives no OS-level guarantee (Windows does, via the Job Object); the
+  children then see EOF on stdin, which ends a well-behaved MCP server.
 
 ## 4. Build from source
 
-This project builds under the **Visual Studio 2022 BuildTools** environment
-(`vcvars64.bat`); the included `_build.ps1` captures that environment and runs
-the release build. A normal `cargo build` from a **VS Developer Command Prompt**
-also works.
+**Windows.** This project builds under the **Visual Studio 2022 BuildTools**
+environment (`vcvars64.bat`); the included `_build.ps1` captures that
+environment and runs the release build. A normal `cargo build` from a **VS
+Developer Command Prompt** also works.
+
+**macOS.** Install the Xcode command line tools (`xcode-select --install`) and
+Rust; then `cargo build` / `cargo test` work from `src-tauri` as below.
 
 ```bash
 # Debug build + tests (from src-tauri)
@@ -217,13 +264,23 @@ cargo test
 cargo build --release
 
 # Windows NSIS installer (needs the Tauri prerequisites)
-cargo tauri build
+npx @tauri-apps/cli@2 build
+
+# macOS app bundle (Patchbay.app)
+npx @tauri-apps/cli@2 build --bundles app
+
+# macOS universal (Apple silicon + Intel) — first: rustup target add x86_64-apple-darwin
+npx @tauri-apps/cli@2 build --bundles app --target universal-apple-darwin
 ```
 
+The Tauri CLI is run through `npx`, so there is no need to install
+`cargo tauri`. CI builds and tests on both `windows-latest` and `macos-latest`.
+
 Targets: release **binary < 12 MB**, **idle RAM < 40 MB in tray mode**
-(currently ~3 MB binary / ~16 MB idle RAM). Window mode adds a WebView2 process
-once the popover has been opened at least once — the window is created lazily,
-so a user who stays in tray mode pays nothing. Bound strictly to `127.0.0.1`.
+(currently ~3 MB binary / ~16 MB idle RAM, measured on Windows). Window mode
+adds a webview process (WebView2 on Windows, WKWebView on macOS) once the
+popover has been opened at least once — the window is created lazily, so a user
+who stays in tray mode pays nothing. Bound strictly to `127.0.0.1`.
 
 ## Architecture
 
@@ -234,14 +291,17 @@ so a user who stays in tray mode pays nothing. Bound strictly to `127.0.0.1`.
  Antigravity ──┤   http://127.0.0.1:39100/mcp                 │     e.g. npx some-mcp
  Kilo ─────────┤   - per-agent session + notification stream  │
                 │   - tools exposed as <jack>__<tool>         ├──► streamable-http jack
-                │   - DPAPI-encrypted secrets                 │     e.g. https://host/mcp
+                │   - encrypted secrets (DPAPI / Keychain)    │     e.g. https://host/mcp
                 └──────────────────────┬──────────────────────┘
-                                       │ Windows tray (Tauri v2)
+                                       │ tray / menu bar (Tauri v2)
                                        ▼
                           toggle jacks / per-agent perms
-                          config: %APPDATA%\Patchbay\patchbay.json
-                          state:  %APPDATA%\Patchbay\patchbay.state.json
+                          config: <config dir>/patchbay.json
+                          state:  <config dir>/patchbay.state.json
 ```
+
+`<config dir>` is `%APPDATA%\Patchbay\` on Windows and
+`~/Library/Application Support/Patchbay/` on macOS.
 
 Patchbay speaks the [Model Context Protocol](https://modelcontextprotocol.io)
 over Streamable HTTP. The gateway is hand-rolled (JSON-RPC on axum/tokio — no
@@ -252,7 +312,8 @@ the user-facing [`ABOUT.txt`](ABOUT.txt).
 ## Documentation
 
 - [Architecture](docs/architecture.md) — modules, layers, key decisions.
-- [Security model](docs/security.md) — trust boundary, DPAPI, localhost binding.
+- [Security model](docs/security.md) — trust boundary, DPAPI / Keychain secrets,
+  localhost binding.
 - [ABOUT.txt](ABOUT.txt) — full user-facing guide (every tray menu item).
 - [CHANGELOG.md](CHANGELOG.md) — release history.
 

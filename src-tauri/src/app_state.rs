@@ -450,7 +450,7 @@ impl AppState {
         Ok(())
     }
 
-    /// (S13) Persist `autostart` and update the Windows Run key.
+    /// (S13) Persist `autostart` and update the OS login item (Run key / LaunchAgent).
     ///
     /// Lifted out of the tray click handler so the window drives the SAME code
     /// rather than a second copy — a duplicated implementation is exactly how

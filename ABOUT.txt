@@ -76,7 +76,7 @@ CONNECT APPROVAL
 ------------------
 Settings > "Require approval for new agents" (off by default). When
 turned on, the FIRST time an identity Patchbay has never seen tries to
-connect, a Windows dialog pops up asking Allow or Deny before it gets any
+connect, a system dialog pops up asking Allow or Deny before it gets any
 tools. Allow remembers it as a normal seen agent; Deny adds it straight
 to the Forbidden list (see below) so it's rejected automatically from
 then on, with no further prompts. Once an identity has been seen once
@@ -91,6 +91,11 @@ agent by default), unchecked means unpatched (off, tools hidden, calls
 rejected with an explanation). Click a checkbox to flip it instantly. The
 tray tooltip always shows whether the gateway is running and how many
 jacks are patched in, plus the URL agents should connect to.
+
+Patchbay runs on Windows and on macOS 11 or later. On Windows the "tray"
+is the system tray; on macOS it is the icon in the menu bar (a
+monochrome icon that follows light and dark mode — there is no Dock
+icon). Everything below works the same on both unless it says otherwise.
 
 Directly below the jack list: "Settings" (everything below), then
 "About [<version>]" (this file), then "Quit".
@@ -143,28 +148,35 @@ Inside "Settings":
     healthy. If it still fails, the tooltip keeps showing the problem.
 
   Reload config
-    Re-reads %APPDATA%\Patchbay\patchbay.json from disk, applies any
-    server changes (start/stop whatever's different), and refreshes
-    every connected agent's tool list. Also picks up a changed "port"
-    value and rebinds the gateway's listener live — no full restart
-    needed. Use this if you (or an AI agent) edited that file by hand —
-    Patchbay doesn't watch it automatically.
+    Re-reads patchbay.json from disk (see "Under the hood" for where it
+    lives), applies any server changes (start/stop whatever's different),
+    and refreshes every connected agent's tool list. Also picks up a
+    changed "port" value and rebinds the gateway's listener live — no
+    full restart needed. Use this if you (or an AI agent) edited that
+    file by hand — Patchbay doesn't watch it automatically.
 
   Open config file
-    Opens the config file in a text editor, in case you want to add,
-    remove, or tweak a server by hand.
+    Opens the config file in a text editor (Notepad on Windows, your
+    default text editor on macOS), in case you want to add, remove, or
+    tweak a server by hand.
 
   Open logs folder
-    Opens the folder that holds Patchbay's log files, so you can inspect
-    or share them when diagnosing a problem.
+    Opens the folder that holds Patchbay's log files (in Explorer on
+    Windows, Finder on macOS), so you can inspect or share them when
+    diagnosing a problem.
 
   Copy gateway URL
     Puts Patchbay's address on your clipboard — paste it into any
     MCP-capable agent's settings to connect it through Patchbay.
 
-  Start with Windows
+  Start with Windows        (on macOS the item is called "Start at login")
     Launches Patchbay automatically at login, so your agents' one MCP
-    connection is always there without you thinking about it.
+    connection is always there without you thinking about it. On Windows
+    this adds a "Patchbay" value to your user's Run registry key. On
+    macOS it writes a LaunchAgent file,
+      ~/Library/LaunchAgents/dev.patchbay.app.plist
+    which takes effect from your next login and shows up in System
+    Settings > General > Login Items; turning the item off removes it.
 
   Require approval for new agents
     See "Connect approval" above. Off by default.
@@ -185,7 +197,7 @@ automatically, same as everything else.
 
 THE WINDOW
 -----------
-A Windows menu closes the instant you click anything in it. That is fine
+A tray menu closes the instant you click anything in it. That is fine
 for one quick toggle you already know the position of, and poor for
 everything else: you cannot see whether the checkbox actually moved, a
 server that needs a second to start has nowhere to say "starting..." or
@@ -193,8 +205,8 @@ server that needs a second to start has nowhere to say "starting..." or
 menu four times.
 
 Turn it on in Settings > Interface. The window is a small panel that
-appears next to the tray icon and closes when you click away or press Esc.
-It has three screens:
+appears next to the tray icon and closes with its X button, with the tray
+icon again, or with Esc. It has three screens:
 
   Servers   One row per jack with a switch, the transport, the live tool
             count, and any failure written on the row itself with a
@@ -211,17 +223,25 @@ It has three screens:
             agent to give it its own per-server permissions, or to hand it
             back to the global list.
 
-  Settings  Interface, gateway port, start with Windows, the approval
-            gate, request logging, and the config and log folders.
+  Settings  Interface, gateway port, start with Windows (start at login
+            on macOS), the approval gate, request logging, and the config
+            and log folders.
 
 Both interfaces drive exactly the same state, so a change in one shows up
 in the other immediately, even with "Both" selected and the menu open.
 
 The window is only created the first time you open it: if you stay on the
-tray menu, Patchbay never starts a browser engine at all. It needs the
-WebView2 runtime, which ships with Windows 11 and current Windows 10. If
-it cannot start, Patchbay writes the reason to its log and falls back to
-the tray menu for that session WITHOUT changing your setting.
+tray menu, Patchbay never starts a browser engine at all. On Windows it
+needs the WebView2 runtime, which ships with Windows 11 and current
+Windows 10; on macOS it uses the system's built-in WKWebView, so there is
+nothing to install. If it cannot start, Patchbay writes the reason to its
+log and falls back to the tray menu for that session WITHOUT changing
+your setting.
+
+Starting Patchbay again while it is already running (from the Start menu,
+Finder or Spotlight; on macOS also the system "reopen") opens the window
+at the tray icon instead of doing nothing, so there is always a way back
+to it. "Show window" also works before you have ever clicked the icon.
 
 One safety note worth knowing: an agent chooses its own name, and nothing
 authenticates it. Patchbay cleans that name up before storing or showing
@@ -235,7 +255,8 @@ DELETING AN AGENT
 purges an identity from Patchbay's memory: it's removed from the
 seen-agents list, its Custom permission list (if any) is erased
 entirely, and it's removed from the Forbidden list if it was on it. Asks
-for confirmation first, since this can't be undone. If the exact same
+for confirmation first, since this can't be undone (in a system dialog
+whose default answer is Cancel on macOS). If the exact same
 identity connects again afterward, Patchbay treats it as a brand new
 agent it's never seen — including triggering the connect-approval prompt
 again, if that setting is on. Use this to clean up test agents or ones
@@ -244,13 +265,13 @@ you no longer use, so they stop cluttering the Custom/Forbidden lists.
 UNDER THE HOOD
 ---------------
 Patchbay is a small Rust program built on Tauri 2 for the tray icon and
-Windows integration — there's no visible window, it's a background
-process with a menu. The gateway itself is implemented directly as a
-JSON-RPC/MCP server on axum and tokio, rather than delegated to a
-generic SDK, so Patchbay can control session tracking and live tool-list
-notifications directly (each connected agent gets its own tracked
-session and its own notification stream, so a tools-list change reaches
-every agent's live session correctly).
+the operating-system integration — there's no visible window unless you
+ask for one, it's a background process with a menu. The gateway itself
+is implemented directly as a JSON-RPC/MCP server on axum and tokio,
+rather than delegated to a generic SDK, so Patchbay can control session
+tracking and live tool-list notifications directly (each connected agent
+gets its own tracked session and its own notification stream, so a
+tools-list change reaches every agent's live session correctly).
 
 Upstream servers are connected either as a local child process (stdio,
 for MCP servers you'd normally run via npx or a similar launcher) or as
@@ -258,25 +279,47 @@ a remote HTTP endpoint (Streamable HTTP, for hosted MCP servers). A
 shared server process stays running as long as EITHER the global
 checkbox is on OR at least one agent's own Custom list wants it on — so
 turning a server off globally doesn't stop it for an agent who's
-specifically opted it back in via Custom permissions. Child processes
-are attached to a Windows Job Object so that quitting Patchbay or
-flipping a server off cannot leave orphaned processes behind — the OS
-guarantees the cleanup.
+specifically opted it back in via Custom permissions.
+
+Keeping child processes from being orphaned works differently per
+system. On Windows they are attached to a Job Object, so quitting
+Patchbay or flipping a server off cannot leave orphans behind — the OS
+guarantees the cleanup, even if Patchbay crashes. On macOS each child
+leads its own process group: flipping a server off kills the whole group
+(for example npx and the node it started), and quitting Patchbay — Quit
+from the tray or the window, logging out, or a termination
+signal — kills every group. The one gap: if Patchbay itself is
+force-killed or crashes, macOS gives no OS-level guarantee; the children
+see their input close, which ends a well-behaved MCP server. Also on
+macOS, an app started from Finder or at login gets only a minimal PATH,
+so at startup Patchbay asks your login shell for its PATH (5 seconds at
+most) and adds the usual Homebrew, ~/.local/bin, ~/.cargo/bin,
+~/.bun/bin and ~/.volta/bin folders — so npx, node, uvx and docker in a
+server's command are found just as in a terminal.
 
 Secrets — API keys, bearer tokens, anything sensitive in a server's
 config, including environment variables and HTTP authorization headers
-— are encrypted at rest using Windows' own DPAPI, tied to your Windows
-user account, the moment they're saved. There is no separate password or
-master key to manage.
+— are encrypted at rest the moment they're saved. On Windows that is
+Windows' own DPAPI, tied to your Windows user account. On macOS it is
+AES-256-GCM with a random key that lives in your login Keychain (an
+item named "config-encryption-key" for "dev.patchbay.app"). Either way
+there is no separate password or master key to manage, and a copied
+config file is useless without your account or Keychain. A value
+encrypted on the other kind of system can't be opened (it comes out
+empty and the log says to re-enter it).
 
-Config lives at %APPDATA%\Patchbay\patchbay.json, with the previous
-version kept beside it as patchbay.json.bak. A second, throwaway file,
-patchbay.state.json, records which agents have connected and when — it
-holds nothing secret and you can delete it at any time; the only effect
-is that agents Patchbay already knew will look new again. Logs (for
-troubleshooting) are at %APPDATA%\Patchbay\logs\. Patchbay binds
-strictly to 127.0.0.1 — it is never reachable from the network, only
-from this machine.
+Config lives in patchbay.json, with the previous version kept beside it
+as patchbay.json.bak. A second, throwaway file, patchbay.state.json,
+records which agents have connected and when — it holds nothing secret
+and you can delete it at any time; the only effect is that agents
+Patchbay already knew will look new again. Logs (for troubleshooting)
+are in the logs folder next to them. All of it is in Patchbay's folder:
+
+    Windows   %APPDATA%\Patchbay\
+    macOS     ~/Library/Application Support/Patchbay/
+
+Patchbay binds strictly to 127.0.0.1 — it is never reachable from the
+network, only from this machine.
 
 An agent can switch a server OFF for itself, but it cannot switch one
 ON. Only you can do that, from the tray icon or the Patchbay window.

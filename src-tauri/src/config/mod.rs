@@ -905,8 +905,9 @@ mod tests {
     fn the_state_file_sits_beside_its_own_config() {
         // Derived from the config path, not fixed: two tests (or a test and the
         // real app) must never share one notebook.
-        let a = state_path_for(Path::new(r"C:\x\patchbay.json"));
-        let b = state_path_for(Path::new(r"C:\x\patchbay_test_7.json"));
+        let dir = std::env::temp_dir().join("x");
+        let a = state_path_for(&dir.join("patchbay.json"));
+        let b = state_path_for(&dir.join("patchbay_test_7.json"));
         assert_eq!(a.file_name().unwrap(), "patchbay.state.json");
         assert_eq!(b.file_name().unwrap(), "patchbay_test_7.state.json");
         assert_eq!(a.parent(), b.parent());

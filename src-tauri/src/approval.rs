@@ -2,8 +2,10 @@
 //!
 //! When a client identity connects to Patchbay for the FIRST TIME (not yet in
 //! `seen_clients`, not already `forbidden_clients`, and the global
-//! `require_approval_for_new_clients` gate is ON), a native Win32 modal asks the
-//! user "Allow or deny?". The result drives the config decision in
+//! `require_approval_for_new_clients` gate is ON), a native modal asks the
+//! user "Allow or deny?" — a Win32 `MessageBoxW` on Windows, an AppleScript
+//! `display dialog` (run by `/usr/bin/osascript`) on macOS. The result drives
+//! the config decision in
 //! [`crate::app_state::AppState::ensure_client_approved`].
 //!
 //! [`show_approval_dialog`] is a BLOCKING call: `MessageBoxW` runs its own
@@ -76,11 +78,24 @@ pub fn show_approval_dialog(identity: &str) -> bool {
     result == IDYES
 }
 
-/// Non-Windows fallback (the shipped binary is Windows-only, but a stub keeps
-/// non-Windows compiles/tests green): default to ALLOW so the app still
-/// functions without a dialog. The real decision logic in `AppState` is the part
-/// under test; this side effect is live-verification-only on Windows anyway.
-#[cfg(not(windows))]
+/// macOS: the same question as a native AppleScript dialog. `osascript` runs
+/// it in its own process, so this blocks the calling std thread (never the
+/// tokio runtime or the main thread) until the user answers, exactly like
+/// `MessageBoxW`. Allow is the default button, as Yes is on Windows.
+#[cfg(target_os = "macos")]
+pub fn show_approval_dialog(identity: &str) -> bool {
+    let body = format!(
+        "'{}' wants to connect to Patchbay for the first time.\n\n\
+         Allow this AI agent to access your configured MCP servers?",
+        identity
+    );
+    mac::ask(&body, "Deny", "Allow", "Allow", mac::app_icon().as_deref())
+}
+
+/// Fallback for other platforms (none is shipped): default to ALLOW so the app
+/// still functions without a dialog. The decision logic in `AppState` is the
+/// part under test.
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn show_approval_dialog(_identity: &str) -> bool {
     true
 }
@@ -152,12 +167,113 @@ pub fn show_delete_confirm_dialog(identity: &str) -> bool {
     result == IDYES
 }
 
-/// Non-Windows fallback (live binary is Windows-only; the stub keeps non-Windows
-/// compiles/tests green): DENY-BY-DEFAULT (`false`). Unlike the ALLOW-by-default
-/// [`show_approval_dialog`] stub, a destructive confirm dialog that cannot
-/// actually show UI must NEVER default to deleting anything — a stub that can't
-/// ask should refuse the irreversible action.
-#[cfg(not(windows))]
+/// macOS: the same confirmation as an AppleScript dialog with the caution icon.
+/// Cancel is the default button, so a stray Return never deletes anything.
+#[cfg(target_os = "macos")]
+pub fn show_delete_confirm_dialog(identity: &str) -> bool {
+    let body = format!(
+        "Are you sure you want to permanently delete '{}' from Patchbay?\n\n\
+         This removes it from the known agents list and any Custom permissions it \
+         had. If it connects again, it will be treated as a new agent.",
+        identity
+    );
+    mac::ask(&body, "Cancel", "Delete", "Cancel", None)
+}
+
+/// Fallback for other platforms (none is shipped): DENY-BY-DEFAULT (`false`).
+/// Unlike the ALLOW-by-default [`show_approval_dialog`] fallback, a destructive
+/// confirm dialog that cannot actually show UI must NEVER default to deleting
+/// anything.
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn show_delete_confirm_dialog(_identity: &str) -> bool {
     false
+}
+
+#[cfg(target_os = "macos")]
+mod mac {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use crate::utils::log::log;
+
+    /// Quote `text` as an AppleScript string expression. The identity shown in
+    /// the dialog comes from an untrusted `clientInfo.name`, so backslashes and
+    /// quotes are escaped (nothing can break out of the literal), control
+    /// characters are dropped, and line breaks become `& return &`.
+    pub fn applescript_string(text: &str) -> String {
+        let parts: Vec<String> = text
+            .split('\n')
+            .map(|line| {
+                let clean: String = line.chars().filter(|c| !c.is_control()).collect();
+                let escaped = clean.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("\"{escaped}\"")
+            })
+            .collect();
+        parts.join(" & return & ")
+    }
+
+    /// The bundle's icon (`Patchbay.app/Contents/Resources/*.icns`), when
+    /// running from an app bundle.
+    pub fn app_icon() -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        let resources = exe.parent()?.parent()?.join("Resources");
+        std::fs::read_dir(resources)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "icns"))
+    }
+
+    /// Show a two-button dialog and block until the user answers. Returns
+    /// `true` only when `ok` was clicked; Cancel, Escape, or any failure to
+    /// show the dialog count as `false`.
+    pub fn ask(body: &str, cancel: &str, ok: &str, default: &str, icon: Option<&Path>) -> bool {
+        let icon = match icon {
+            Some(p) => format!("POSIX file {}", applescript_string(&p.to_string_lossy())),
+            None => "caution".to_string(),
+        };
+        let script = format!(
+            "activate\ndisplay dialog {body} with title \"Patchbay\" \
+             buttons {{{cancel_q}, {ok_q}}} default button {default_q} \
+             cancel button {cancel_q} with icon {icon}",
+            body = applescript_string(body),
+            cancel_q = applescript_string(cancel),
+            ok_q = applescript_string(ok),
+            default_q = applescript_string(default),
+        );
+        match Command::new("/usr/bin/osascript").arg("-e").arg(&script).output() {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    // -128 is "User canceled": a normal answer, not an error.
+                    if !stderr.contains("(-128)") {
+                        log(&format!("approval: osascript dialog failed: {}", stderr.trim()));
+                    }
+                    return false;
+                }
+                stdout.trim() == format!("button returned:{ok}")
+            }
+            Err(e) => {
+                log(&format!("approval: could not run osascript: {e}"));
+                false
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::applescript_string;
+
+        #[test]
+        fn quotes_and_backslashes_cannot_break_out() {
+            let q = applescript_string(r#"evil" & do shell script "x" & "\"#);
+            assert_eq!(q, r#""evil\" & do shell script \"x\" & \"\\""#);
+        }
+
+        #[test]
+        fn line_breaks_become_return_and_controls_are_dropped() {
+            assert_eq!(applescript_string("a\nb\u{7}c"), r#""a" & return & "bc""#);
+        }
+    }
 }

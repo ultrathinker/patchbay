@@ -14,7 +14,7 @@
 //!
 //! ## The absolute rule: no secrets cross this boundary
 //! [`UiSnapshot`] carries names, flags, counts and statuses. It carries no jack
-//! `env` values, no `headers`, no URL, and no `dpapi:` blobs — not even in
+//! `env` values, no `headers`, no URL, and no `dpapi:`/`keychain:` blobs — not even in
 //! encrypted form. Secrets travel one way only: they may be typed into the
 //! "Add server" form and handed to [`crate::app_state::AppState::add_jack`],
 //! which persists them DPAPI-encrypted; nothing sends them back. Enforced by
@@ -537,7 +537,7 @@ mod tests {
         let snap = build_snapshot(&state, "1.3.0");
         let json = serde_json::to_string(&snap).expect("serialize");
 
-        for secret in ["HEADERSECRET", "ENVSECRET", "URLSECRET", "Bearer", "dpapi:"] {
+        for secret in ["HEADERSECRET", "ENVSECRET", "URLSECRET", "Bearer", "dpapi:", "keychain:"] {
             assert!(
                 !json.contains(secret),
                 "snapshot leaked '{}': {}",

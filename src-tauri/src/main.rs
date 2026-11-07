@@ -16,11 +16,17 @@ use tauri::Manager; // brings `.manage()` into scope on App
 use utils::log::{self, log};
 
 fn main() {
-    // Level-1 logger FIRST: every later `log(...)` (which delegates to
-    // `log::info!`) and the panic hook's `log::error!` depend on flexi_logger
-    // being installed. Writes to `%APPDATA%\Patchbay\logs\patchbay_rCURRENT.log`
-    // with size rotation + cleanup. Leaked internally so it lives for the run.
-    log::init_logger();
+    // macOS: adopt the login shell's PATH so stdio jacks find npx/node/uvx when
+    // Patchbay was started from Finder or at login. Must run before ANY thread
+    // exists (it calls `set_var`), so even before the logger; logged in setup.
+    #[cfg(target_os = "macos")]
+    let path_note = utils::shell_env::import_login_path();
+
+    // NOTE: the Level-1 logger is started at the top of `setup`, not here. The
+    // single-instance plugin ends a SECOND launch before `setup` runs; starting
+    // the logger earlier let that short-lived process rotate the running
+    // instance's `patchbay_rCURRENT.log` away (the running one kept writing to
+    // the renamed generation). Nothing logs before `setup`.
 
     // Panic hook: log the panic (message + location) via the same Level-1
     // logger so a crash leaves a trace in patchbay_rCURRENT.log, THEN chain the
@@ -36,7 +42,6 @@ fn main() {
         default_hook(info);
     }));
 
-    log("main: Patchbay starting");
 
     tauri::Builder::default()
         // (S13) The popover window's IPC surface. Each command is a thin wrapper
@@ -69,13 +74,29 @@ fn main() {
             ui::ui_close_window,
             ui::ui_quit,
         ])
-        .plugin(tauri_plugin_single_instance::init(|_app, _args, _cwd| {
-            // No window (tray-only app), so there is nothing to focus/show. A second
-            // launch just logs and no-ops.
-            log("single-instance: second launch ignored (tray-only, no window)");
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // A second launch (Start menu, Finder, Spotlight) means "show me
+            // Patchbay": open the popover window at the tray icon.
+            log("single-instance: second launch, showing the window");
+            tray::show_window_anywhere(app);
         }))
-        .setup(|app| {
+        .setup(move |app| {
+            // Level-1 logger first: every later `log(...)` (a `log::info!`
+            // wrapper) and the panic hook's `log::error!` need it. Writes
+            // `<config dir>/Patchbay/logs/patchbay_rCURRENT.log` (`%APPDATA%`
+            // on Windows, `~/Library/Application Support` on macOS) with size
+            // rotation + cleanup. Leaked internally so it lives for the run.
+            log::init_logger();
+            log(&format!("main: Patchbay {} starting", env!("CARGO_PKG_VERSION")));
+            #[cfg(target_os = "macos")]
+            log(&path_note);
             log("setup: begin");
+
+            // macOS: a menu-bar app — no Dock icon, no app menu, never steals
+            // the active-app slot (Info.plist LSUIElement does the same for
+            // the bundle before this code runs).
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             // ---- Config (S1): load once, log a summary, surface violations ----
             // Light work (one small JSON read), done synchronously on the setup
@@ -147,8 +168,16 @@ fn main() {
             let menu = tray::build_menu(handle, &app_state)?;
             let tooltip = tray::tooltip_text(handle);
 
-            let _tray = TrayIconBuilder::with_id(tray::TRAY_ID)
-                .icon(tauri::include_image!("icons/32x32.png"))
+            // Windows: the full-colour icon. macOS: a monochrome template image
+            // that the menu bar tints for light/dark mode and the highlight.
+            #[cfg(not(target_os = "macos"))]
+            let tray_builder =
+                TrayIconBuilder::with_id(tray::TRAY_ID).icon(tauri::include_image!("icons/32x32.png"));
+            #[cfg(target_os = "macos")]
+            let tray_builder = TrayIconBuilder::with_id(tray::TRAY_ID)
+                .icon(tauri::include_image!("icons/tray-template.png"))
+                .icon_as_template(true);
+            let _tray = tray_builder
                 .tooltip(tooltip)
                 .menu(&menu)
                 .show_menu_on_left_click(true)
@@ -178,10 +207,52 @@ fn main() {
                 tray::refresh_tooltip(&refresh_handle);
             });
 
+            // Unix: SIGTERM/SIGINT/SIGHUP (logout, `kill`, Ctrl+C in a terminal)
+            // must also take the stdio children down. The default action would
+            // end the process at once and skip `RunEvent::Exit`.
+            #[cfg(unix)]
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let (Ok(mut term), Ok(mut int), Ok(mut hup)) = (
+                        signal(SignalKind::terminate()),
+                        signal(SignalKind::interrupt()),
+                        signal(SignalKind::hangup()),
+                    ) else {
+                        log("setup: could not install signal handlers");
+                        return;
+                    };
+                    let name = tokio::select! {
+                        _ = term.recv() => "SIGTERM",
+                        _ = int.recv() => "SIGINT",
+                        _ = hup.recv() => "SIGHUP",
+                    };
+                    log(&format!("main: {name} received, stopping upstreams and exiting"));
+                    upstream::process::kill_all();
+                    handle.exit(0);
+                });
+            }
+
             log("setup: tray ready");
             log("setup: complete, event loop starting");
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Patchbay");
+        .build(tauri::generate_context!())
+        .expect("error while building Patchbay")
+        .run(|_app, event| match event {
+            // Quit from the window (`app.exit`) or the OS (logout, Cmd+Q on
+            // macOS) ends here: kill the stdio children's process groups
+            // (macOS/Unix). On Windows the Job Object already does it.
+            tauri::RunEvent::Exit => upstream::process::kill_all(),
+            // macOS: the user opened Patchbay again while it runs (Finder,
+            // Spotlight). LaunchServices activates this process instead of
+            // starting a second one, so this is the "second launch" there.
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { .. } => {
+                log("main: reopened by the user, showing the window");
+                tray::show_window_anywhere(_app);
+            }
+            _ => {}
+        });
 }

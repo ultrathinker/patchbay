@@ -11,9 +11,13 @@ permissions:
 
 jobs:
   build-and-test:
-    # Patchbay is a Windows-only app: it depends on the `windows` crate
-    # (DPAPI, Job Objects, the tray via Tauri) and won't compile elsewhere.
-    runs-on: windows-latest
+    # Patchbay ships for Windows (DPAPI, Job Objects, Run key) and macOS
+    # (Keychain, process groups, LaunchAgent): build and test on both.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v7

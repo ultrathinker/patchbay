@@ -29,6 +29,14 @@
 (function () {
   "use strict";
 
+  // The window runs in WebView2 on Windows and WKWebView on macOS; only a few
+  // labels differ between the two.
+  var IS_MAC = /Macintosh|Mac OS X/.test(navigator.userAgent);
+  var AUTOSTART_LABEL = IS_MAC ? "Start at login" : "Start with Windows";
+  var SECRET_HINT = IS_MAC
+    ? "Stored encrypted with a key in your macOS Keychain. Never shown again."
+    : "Stored encrypted with your Windows account. Never shown again.";
+
   var h = preact.h;
   var render = preact.render;
   var useState = preactHooks.useState;
@@ -691,7 +699,7 @@
             />
           </div>
           <span class="field-hint">
-            Stored encrypted with your Windows account. Never shown again.
+            ${SECRET_HINT}
           </span>
         </div>
 
@@ -794,8 +802,8 @@
         </div>
 
         <button class="row" onClick=${function () { toggle("ui_set_autostart", !s.autostart); }}>
-          <${Switch} on=${s.autostart} label="Start with Windows" />
-          <span class="row-body"><span class="row-name">Start with Windows</span></span>
+          <${Switch} on=${s.autostart} label=${AUTOSTART_LABEL} />
+          <span class="row-body"><span class="row-name">${AUTOSTART_LABEL}</span></span>
         </button>
 
         <button

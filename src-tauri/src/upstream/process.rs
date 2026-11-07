@@ -1,6 +1,16 @@
-//! Windows Job Object: one process-wide, `KILL_ON_JOB_CLOSE`, assigned to each
-//! upstream child so no spawned MCP server outlives Patchbay (even on
-//! crash/kill). MASTER_PLAN D4 "zero orphans".
+//! Zero orphans (MASTER_PLAN D4): no spawned MCP server may outlive Patchbay.
+//!
+//! **Windows** — a Job Object: one process-wide, `KILL_ON_JOB_CLOSE`, assigned
+//! to each upstream child, so the OS kills the whole tree (cmd -> npx -> node)
+//! when Patchbay exits, even on a crash or a kill.
+//!
+//! **macOS / Unix** — process groups: each child is spawned as the leader of
+//! its own group (`process_group(0)` in `stdio.rs`) and its pid is registered
+//! here. Stopping a jack kills the whole group ([`kill_tree`]), and quitting
+//! kills every registered group ([`kill_all`]). A pid stays reserved until the
+//! child is reaped, and `kill_tree` runs before the reap, so a recycled pid is
+//! never hit. There is no OS-level kill-on-crash on Unix: if Patchbay itself is
+//! killed, a child sees EOF on its stdin, which ends a well-behaved MCP server.
 //!
 //! Assigns **by pid** via `OpenProcess` (we hold the tokio `Child`, but a pid is
 //! the simplest cross-module handle and the Job Object API only needs a process
@@ -110,27 +120,93 @@ mod imp {
     }
 }
 
-// ---- Non-Windows stub (keeps the module compiling off-target) --------------
+// ---- Unix implementation: process groups -----------------------------------
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 mod imp {
+    use std::collections::HashSet;
+
+    use parking_lot::Mutex;
+
     use crate::utils::log::log;
 
-    /// No-op Job placeholder on non-Windows targets. The public API mirrors the
-    /// Windows variant so callers are identical regardless of target.
+    /// Process-group ids (= leader pids) of live upstream children.
+    static GROUPS: Mutex<Option<HashSet<i32>>> = Mutex::new(None);
+
+    /// Mirrors the Windows `Job` API so callers are identical on every target.
     #[derive(Debug)]
     pub struct Job;
 
     impl Job {
         pub fn create_kill_on_close() -> Option<Self> {
-            log("process: Job Object is Windows-only; orphan-kill disabled on this target");
+            log("process: upstream children run in their own process groups, killed on stop and quit");
             Some(Job)
         }
 
-        pub fn assign_pid(&self, _pid: u32) {
-            // No-op on non-Windows.
+        /// Register a child spawned with `process_group(0)`: its pid is its pgid.
+        pub fn assign_pid(&self, pid: u32) {
+            GROUPS.lock().get_or_insert_with(HashSet::new).insert(pid as i32);
+        }
+    }
+
+    fn killpg(pgid: i32) {
+        // SAFETY: killpg is a plain syscall on an integer id; the worst outcome
+        // of a stale id is ESRCH, which is ignored.
+        let rc = unsafe { libc::killpg(pgid as libc::pid_t, libc::SIGKILL) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                log(&format!("process: killpg({pgid}) failed: {err}"));
+            }
+        }
+    }
+
+    pub fn kill_tree(pid: u32) {
+        let pgid = pid as i32;
+        let known = GROUPS.lock().as_mut().map(|g| g.remove(&pgid)).unwrap_or(false);
+        if known {
+            killpg(pgid);
+        }
+    }
+
+    pub fn kill_all() {
+        let groups: Vec<i32> = GROUPS
+            .lock()
+            .as_mut()
+            .map(|g| g.drain().collect())
+            .unwrap_or_default();
+        if !groups.is_empty() {
+            log(&format!("process: killing {} upstream process group(s) on exit", groups.len()));
+        }
+        for g in groups {
+            killpg(g);
         }
     }
 }
 
+#[cfg(windows)]
+mod tree {
+    /// The Job Object reaps the tree; nothing to do per child.
+    pub fn kill_tree(_pid: u32) {}
+    /// The Job Object kills everything when the process exits.
+    pub fn kill_all() {}
+}
+
+#[cfg(unix)]
+mod tree {
+    pub use super::imp::{kill_all, kill_tree};
+}
+
 pub use imp::Job;
+
+/// Kill an upstream child together with everything it started. Call it while
+/// the child is still un-reaped (before `wait`). No-op on Windows (Job Object).
+pub fn kill_tree(pid: u32) {
+    tree::kill_tree(pid)
+}
+
+/// Kill every upstream child still running. Call it right before the process
+/// exits. No-op on Windows (Job Object).
+pub fn kill_all() {
+    tree::kill_all()
+}
