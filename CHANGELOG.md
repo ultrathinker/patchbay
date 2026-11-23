@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.1] — 2026-11-23
+
+### Security
+- **rustls 0.23.41 → 0.23.46.** rustls is the TLS library behind Patchbay's HTTPS
+  connections to remote MCP servers (`streamable-http` jacks with an `https://`
+  URL; local `http://127.0.0.1` jacks do not use it). The update fixes four
+  advisories: TLS 1.3 handshake messages accepted across encryption-level
+  boundaries (GHSA-2mjx-qc3c-rqvc), TLS secrets exposed by `Debug` formatting of
+  a session (GHSA-c8m5-c952-6cm4), certificate decompression that could
+  allocate up to 1 GiB before authentication (GHSA-h2v8-394m-p7vv), and a
+  forged ServerHello that pinned later connections to a classical key exchange
+  (GHSA-w44r-93j7-qv28). Three of the four need an attacker on the network path
+  or a hostile server; Patchbay never formats a rustls session itself. No
+  behaviour changes.
+
 ## [1.5.0] — 2026-11-23
 
 Scripts and subagents stop becoming "agents". An agent's own script had to put
