@@ -698,6 +698,35 @@ body {
   background: var(--ok-text);
 }
 
+/* (S15) A live helper, hung under its owner. Indented and flat: it is a fact
+   about the row above, not a destination of its own. */
+.row--helper {
+  width: calc(100% - 22px);
+  margin-left: 22px;
+  min-height: 30px;
+  background: transparent;
+  cursor: default;
+}
+.row--helper:hover {
+  background: transparent;
+}
+
+/* (S15) An identity waiting to be let in: a row that carries its own buttons. */
+.row--knock {
+  cursor: default;
+  border-color: var(--stroke-strong);
+}
+.row--knock:hover {
+  background: var(--card);
+}
+
+.hint {
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-dim);
+  padding: 0 2px 8px;
+}
+
 /* Caption introducing the per-server list, so the rows below are visibly
    subordinate to the master switch rather than its siblings. */
 .subhead {

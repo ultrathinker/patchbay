@@ -31,8 +31,13 @@ off in the Patchbay tray and every connected agent picks it up instantly.
   and a work profile of the same tool apart.
 - **Per-agent permissions.** Give any agent its own independent on/off list
   ("Custom permissions"), separate from the global checkboxes.
-- **Approval gate.** Optionally require a one-time Allow/Deny system dialog the
-  first time a brand-new identity connects (off by default).
+- **Helpers, not more agents.** A script or subagent that an agent starts
+  connects as `Owner/label` and is a *helper* of that agent: no approval, no new
+  entry in your agent list, no servers unless its owner names them, and never
+  more than its owner has. See [Scripts and subagents](#scripts-and-subagents-helpers).
+- **Approval gate.** Optionally turn away an identity Patchbay has never seen
+  until you let it in from the Agents screen or the tray menu (off by default).
+  Nothing pops up, and nothing is remembered about a name you ignore.
 - **Honest errors.** Calling an unpatched server returns a clear message to the
   agent instead of a mystery failure. A Patchbay restart invalidates every
   agent's MCP session (in-memory only, unavoidable) — a spec-compliant client
@@ -83,6 +88,38 @@ After this, **never** edit agent configs again; toggle servers in Patchbay.
 | **Codex** | in `~/.codex/config.toml` →<br>`[mcp_servers.patchbay]`<br>`url = "http://127.0.0.1:39100/mcp"` |
 | **Google Antigravity** | in `~/.gemini/config/mcp_config.json` → an entry with<br>`"serverUrl": "http://127.0.0.1:39100/mcp"` |
 | **Kilo** | in its MCP config →<br>`{ "type": "streamable-http", "url": "http://127.0.0.1:39100/mcp" }` |
+
+### Scripts and subagents (helpers)
+
+Agents write scripts, and start other agents, that talk to the gateway on their
+own. Such a caller must not invent a name for itself — every invented name used
+to become one more "agent" in your list, holding the global permissions rather
+than its author's. Instead it says whose it is, with two HTTP headers on
+`initialize`:
+
+    X-Patchbay-Client: Claude Code - Personal/bee-script
+    X-Patchbay-Jacks: bee-memory-bank, limits
+
+- **`X-Patchbay-Client: <owner>/<label>`** — `<owner>` is the exact name the
+  agent itself connects under, `<label>` is any short text. When the owner is an
+  agent Patchbay knows, the session is a **helper** of it: nobody is asked,
+  nothing is recorded, and it shows under its owner in the window only while it
+  is connected.
+- **`X-Patchbay-Jacks`** — what the owner hands over: a comma-separated list
+  of jack names, or `*` for all of the owner's (add `patchbay` to the list for
+  the `patchbay__*` tools). **Without this header a helper gets nothing.**
+- A helper reaches a listed server **only while its owner can**. The list is
+  intersected with the owner's permissions on every request, so a helper never
+  holds more than its owner and loses a server the moment its owner does.
+
+You do not have to teach this to your agents. Patchbay tells each agent its own
+name and this rule in the MCP `instructions` it returns on connect, and a
+caller that turns up under an unknown name while the approval gate is on is
+refused with the same instructions.
+
+A subagent started from the *same* agent profile reads the same MCP config, so
+it connects as the agent itself, with all of its servers. To hold it to a
+subset, start it with its own MCP config carrying the two headers above.
 
 ## 2. Configuring servers (jacks)
 
@@ -180,7 +217,9 @@ upper limit on either.
 - **Agents** — every identity that has connected, with a live dot for the ones
   connected right now, filters (including **Unused**: never seen since first
   contact, or quiet for 30 days), multi-select, and bulk delete or deny with an
-  undo strip. Open one to give it its own per-server permissions.
+  undo strip. Open one to give it its own per-server permissions. Identities
+  the approval gate turned away wait at the top with **Allow** / **Dismiss**,
+  and an agent's live helpers hang under it.
 - **Settings** — interface, gateway port, autostart, the approval gate, request
   logging, and the config/log folders.
 
@@ -211,6 +250,12 @@ macOS, when the menu bar has no room for it).
 - **Open logs folder** — opens the folder holding Patchbay's log files (in
   Explorer on Windows, Finder on macOS).
 - **Enable request logging** (in the Settings submenu) — toggles a second-tier log that records each MCP request/response with secrets redacted; off by default.
+- **New agents waiting [N]** — present only while the approval gate has turned
+  somebody away. **Allow '<name>'** lets that identity in as a new agent (it
+  connects on its next attempt); **Dismiss all** forgets them. The tooltip says
+  when someone is waiting.
+- **Require approval for new agents** (in the Settings submenu) — the approval
+  gate; off by default.
 - **Interface** (in the Settings submenu) — chooses between the tray menu, the
   popover window, or both. See above.
 - **Start with Windows** (on macOS: **Start at login**) — toggles autostart. On

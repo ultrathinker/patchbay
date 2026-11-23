@@ -46,6 +46,13 @@ const MCP_SESSION_ID: &str = "mcp-session-id";
 /// Absent/empty -> graceful fallback to `clientInfo.name` (S10 behavior).
 const PATCHBAY_CLIENT_HEADER: &str = "x-patchbay-client";
 
+/// (S15) Optional header naming the servers a HELPER asks its owner for: a
+/// comma-separated list of jack names, or `*` for all of the owner's. Read on
+/// `initialize` only, and only meaningful when `X-Patchbay-Client` is
+/// `Owner/label` with a known owner. Absent means the helper gets nothing. See
+/// [`crate::gateway::helper`].
+const PATCHBAY_JACKS_HEADER: &str = "x-patchbay-jacks";
+
 // ---- origin validation middleware ----------------------------------------
 
 /// Reject requests whose `Origin` host is not 127.0.0.1 / localhost / [::1].
@@ -116,7 +123,9 @@ fn client_name_for_log(
             .get(MCP_SESSION_ID)
             .and_then(|v| v.to_str().ok())
             .and_then(|id| state.sessions.get(id))
-            .and_then(|s| s.client_name.read().clone())
+            // (S15) `Owner/label` for a helper, so the request log says which
+            // script made the call, not just whose it was.
+            .and_then(|s| s.display_name())
     }
 }
 
@@ -170,12 +179,25 @@ pub async fn post_mcp(
             .and_then(|v| v.to_str().ok())
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        handlers::dispatch(&state, &req, None, header_client).await
+        // (S15) What a helper asks its owner for; ignored for anyone else.
+        let header_jacks: Option<&str> = headers
+            .get(PATCHBAY_JACKS_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let init = handlers::InitHeaders {
+            client: header_client,
+            jacks: header_jacks,
+        };
+        handlers::dispatch_with(&state, &req, None, init).await
     } else {
         let header_val = headers.get(MCP_SESSION_ID).and_then(|v| v.to_str().ok());
         let session = header_val.and_then(|id| state.sessions.get(id));
         match session {
-            Some(s) => handlers::dispatch(&state, &req, Some(s), None).await,
+            Some(s) => {
+                handlers::dispatch_with(&state, &req, Some(s), handlers::InitHeaders::default())
+                    .await
+            }
             // (EXPERIMENT — see comment below) A session id WAS supplied but
             // doesn't resolve (expired, or Patchbay restarted and lost all
             // sessions). Previously (through v1.2.9) `tools/call`/`tools/list`
@@ -271,7 +293,7 @@ pub async fn post_mcp(
 /// a real 404 there let Claude Code silently reinitialize and retry with zero
 /// visible disruption, which the 200 trick had been suppressing.
 fn dead_session_calltool_result() -> serde_json::Value {
-    let text = "You have not established an MCP session with Patchbay yet. Call 'initialize' first, then retry this tool call. If this is your very first connection to Patchbay, the user may need to approve access via a dialog on their screen before tools become available — after initializing, wait a few seconds for that approval, then retry.";
+    let text = "You have not established an MCP session with Patchbay yet. Call 'initialize' first, then retry this tool call. If initialize itself is refused, read its error text: it says how to connect.";
     json!({
         "content": [{ "type": "text", "text": text }],
         "isError": true
@@ -285,7 +307,7 @@ fn dead_session_calltool_result() -> serde_json::Value {
 /// expired/unresolvable session id (that case now returns a real 404 so
 /// spec-compliant clients auto-reconnect transparently).
 fn dead_session_toolslist_result() -> serde_json::Value {
-    let description = "This is a placeholder — Patchbay has no active MCP session for you yet. Call 'initialize' first, then call tools/list again to see the real tools. If this is your very first connection, the user may need to approve access via a dialog on their screen — wait a few seconds after initializing, then retry.";
+    let description = "This is a placeholder — Patchbay has no active MCP session for you yet. Call 'initialize' first, then call tools/list again to see the real tools. If initialize itself is refused, read its error text: it says how to connect.";
     json!({
         "tools": [{
             "name": "patchbay__session_expired",

@@ -18,12 +18,12 @@ key design decisions; where the two platforms differ, both are described.
   the lock for everyone else).
 - **flexi_logger** + **log** — the always-on diagnostic log.
 - **Windows API** (`windows` crate, `winreg`) — DPAPI (secrets), Job Objects
-  (zero-orphan child kill), `MessageBoxW` (approval/confirm dialogs), the HKCU
+  (zero-orphan child kill), `MessageBoxW` (the delete-confirm dialog), the HKCU
   Run key (autostart).
 - **macOS APIs** (`security-framework`, `aes-gcm`, `libc`) — the login Keychain
   (holds the secret-encryption key; AES-256-GCM seals the values), process
-  groups + `killpg` (zero-orphan child kill), `osascript` (approval/confirm
-  dialogs), a LaunchAgent plist (autostart). The app runs as an "accessory"
+  groups + `killpg` (zero-orphan child kill), `osascript` (the delete-confirm
+  dialog), a LaunchAgent plist (autostart). The app runs as an "accessory"
   (menu-bar) app: no Dock icon.
 
 ## Module layout (`src-tauri/src`)
@@ -34,7 +34,7 @@ main.rs                 Entry point: logging bootstrap, panic hook, tray app set
                         Unix signal handlers + exit hook that kill child processes
 tray.rs                 System-tray menu: jacks, Settings, Custom/Forbidden, handlers
 app_state.rs            Shared AppState: jack lifecycle, toggle pipeline, config save
-approval.rs             First-connection Allow/Deny gate and delete-agent confirm
+approval.rs             Delete-agent confirmation
                         (blocking native dialog: MessageBoxW on Windows,
                         `osascript` display dialog on macOS)
 
@@ -48,6 +48,8 @@ gateway/
   http.rs               axum routes (/mcp, /admin/jacks), request logging hook
   jsonrpc.rs            Hand-rolled JSON-RPC framing (no rmcp)
   handlers.rs           tools/call dispatch; built-in patchbay__* meta-tools
+  helper.rs             Helpers (S15): Owner/label identities, X-Patchbay-Jacks
+                        grants, per-caller instructions and refusal texts
   session.rs            Per-agent session tracking + Mcp-Session-Id enforcement
   sse.rs                Per-session SSE notification stream
   tools.rs              Tool-list assembly (merged upstream tools)
@@ -116,6 +118,15 @@ utils/
   and adds the usual install directories (`/opt/homebrew/bin`,
   `/opt/homebrew/sbin`, `/usr/local/bin`, `~/.local/bin`, `~/.cargo/bin`,
   `~/.bun/bin`, `~/.volta/bin`).
+- **Helpers instead of invented identities (S15).** A script or subagent
+  connects as `Owner/label`. `gateway/helper.rs` resolves that to a session
+  whose enforcement identity is the owner, narrowed to the jacks named in
+  `X-Patchbay-Jacks` (nothing by default). Helpers are never recorded and never
+  asked about. An unknown name with the approval gate on is refused at
+  `initialize` and kept in a bounded in-memory waiting list
+  (`AppState::admit_client`) until the user lets it in — there is no approval
+  dialog. `initialize` returns `instructions` built per caller, which is how an
+  agent learns its own name and the rule for its helpers.
 - **Second launch shows the window.** Starting Patchbay again while it runs
   (single-instance callback on both platforms; the macOS "reopen" event) opens
   the popover at the tray icon through `tray::show_window_anywhere`.

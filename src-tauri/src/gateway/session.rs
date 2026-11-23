@@ -19,6 +19,7 @@ use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::gateway::helper::HelperInfo;
 use crate::gateway::sse::list_changed_notification;
 
 /// A session id is the `Mcp-Session-Id` value: a uuid v4 string.
@@ -87,6 +88,13 @@ pub struct ClientSession {
     /// cheap read snapshots the name, then the live config's
     /// `effective_patched` decides visibility.
     pub client_name: RwLock<Option<String>>,
+    /// (S15) Set when this session is a HELPER of `client_name` -- a script or
+    /// subagent that connected as `Owner/label`. `client_name` then holds the
+    /// OWNER, so every per-agent rule (overrides, the forbidden gate) applies
+    /// to the helper exactly as it does to its owner, and this narrows the
+    /// result to the servers the helper was granted. `None` for an ordinary
+    /// agent. See [`crate::gateway::helper`].
+    pub helper: RwLock<Option<HelperInfo>>,
     /// Mutable per-session state (SSE/backlog/dirty).
     pub inner: Mutex<ClientSessionInner>,
 }
@@ -103,6 +111,28 @@ impl ClientSession {
     /// back to the global list only).
     pub fn set_client_name(&self, name: Option<String>) {
         *self.client_name.write() = name;
+    }
+
+    /// (S15) Mark this session as a helper of its `client_name`. Called once,
+    /// from `handle_initialize`, before the session id is handed out.
+    pub fn set_helper(&self, helper: Option<HelperInfo>) {
+        *self.helper.write() = helper;
+    }
+
+    /// The identity as the caller wrote it: `Owner/label` for a helper, the
+    /// plain name otherwise. For logs, where "which script was that?" is the
+    /// question; enforcement always goes by `client_name` alone.
+    pub fn display_name(&self) -> Option<String> {
+        let owner = self.client_name.read().clone()?;
+        match &*self.helper.read() {
+            Some(h) => Some(format!(
+                "{}{}{}",
+                owner,
+                crate::gateway::helper::HELPER_SEPARATOR,
+                h.label
+            )),
+            None => Some(owner),
+        }
     }
 
     /// Register `tx` as this session's canonical notification stream, REPLACING
@@ -255,6 +285,8 @@ pub struct LiveSession {
     /// The resolved client identity, or `None` for a session that initialized
     /// without identifying itself.
     pub client_name: Option<String>,
+    /// (S15) Present when the session is a helper of `client_name`.
+    pub helper: Option<HelperInfo>,
     /// How long since this session last did anything.
     pub idle: Duration,
 }
@@ -285,6 +317,7 @@ impl SessionRegistry {
             initialized: AtomicBool::new(false),
             protocol_version: RwLock::new(String::new()),
             client_name: RwLock::new(None),
+            helper: RwLock::new(None),
             inner: Mutex::new(ClientSessionInner {
                 notification_stream: None,
                 backlog: VecDeque::new(),
@@ -325,6 +358,7 @@ impl SessionRegistry {
             .filter(|s| s.is_initialized())
             .map(|s| LiveSession {
                 client_name: s.client_name.read().clone(),
+                helper: s.helper.read().clone(),
                 idle: now.saturating_duration_since(s.inner.lock().last_seen),
             })
             .collect()

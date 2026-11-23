@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::app_state::AppState;
+use crate::app_state::{Admission, AppState};
+use crate::gateway::helper::{self, HelperInfo, JackGrant};
 use crate::gateway::jsonrpc;
 use crate::gateway::session::{ClientSession, SessionId};
 use crate::gateway::tools;
@@ -79,34 +80,68 @@ impl DispatchOutcome {
     }
 }
 
-/// Dispatch one inbound JSON-RPC request.
-///
-/// `session` is `None` for `initialize` (the call that *creates* a session) and
-/// `Some(resolved)` for every other method — the HTTP layer guarantees a valid
-/// `Mcp-Session-Id` was supplied before reaching here for non-initialize calls.
-///
-/// `header_client` is the (already trimmed, non-empty) value of the
-/// `X-Patchbay-Client` HTTP header when present (S10b). It is consulted ONLY on
-/// `initialize`, where it takes PRIORITY over `clientInfo.name` for resolving
-/// the session's client identity; every other method ignores it (the resolved
-/// identity is cached on the session at initialize time).
-///
-/// `async` because `tools/call` is forwarded to an upstream child (S4); the
-/// lifecycle paths (`initialize`, `initialized`) and the merged `tools/list`
-/// (a synchronous cache snapshot) do not actually await.
+/// The HTTP headers consulted on `initialize` and nowhere else. Both arrive
+/// trimmed and with an empty value already turned into `None` by the HTTP
+/// layer.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InitHeaders<'a> {
+    /// `X-Patchbay-Client` (S10b): the caller's identity, taking PRIORITY over
+    /// `clientInfo.name`. `Owner/label` makes the session a helper of `Owner`
+    /// (S15, see [`crate::gateway::helper`]).
+    pub client: Option<&'a str>,
+    /// `X-Patchbay-Jacks` (S15): the servers a helper asks its owner for --
+    /// comma-separated names, or `*`. Ignored for an ordinary agent.
+    pub jacks: Option<&'a str>,
+}
+
+/// [`dispatch_with`] for a caller that has at most the identity header. The
+/// HTTP layer always goes through `dispatch_with`; this keeps the many tests
+/// that predate `X-Patchbay-Jacks` reading as they did.
+#[cfg(test)]
 pub async fn dispatch(
     state: &AppState,
     req: &jsonrpc::JsonRpcRequest,
     session: Option<Arc<ClientSession>>,
     header_client: Option<&str>,
 ) -> DispatchOutcome {
+    dispatch_with(
+        state,
+        req,
+        session,
+        InitHeaders {
+            client: header_client,
+            jacks: None,
+        },
+    )
+    .await
+}
+
+/// Dispatch one inbound JSON-RPC request.
+///
+/// `session` is `None` for `initialize` (the call that *creates* a session) and
+/// `Some(resolved)` for every other method — the HTTP layer guarantees a valid
+/// `Mcp-Session-Id` was supplied before reaching here for non-initialize calls.
+///
+/// `init` carries the two HTTP headers that matter ONLY on `initialize` (see
+/// [`InitHeaders`]); every other method ignores them, because what they
+/// resolve to is cached on the session at initialize time.
+///
+/// `async` because `tools/call` is forwarded to an upstream child (S4); the
+/// lifecycle paths (`initialize`, `initialized`) and the merged `tools/list`
+/// (a synchronous cache snapshot) do not actually await.
+pub async fn dispatch_with(
+    state: &AppState,
+    req: &jsonrpc::JsonRpcRequest,
+    session: Option<Arc<ClientSession>>,
+    init: InitHeaders<'_>,
+) -> DispatchOutcome {
     // (FIX 9) Any inbound request keeps the session alive (idle reaping).
     if let Some(s) = &session {
         s.touch();
     }
     match req.method.as_str() {
-        "initialize" => handle_initialize(state, req, header_client).await,
-        "notifications/initialized" => handle_initialized(session),
+        "initialize" => handle_initialize(state, req, init).await,
+        "notifications/initialized" => handle_initialized(state, session),
         "tools/list" => handle_tools_list(state, req, session.clone()),
         "tools/call" => handle_tools_call(state, req, session.clone()).await,
         "ping" => {
@@ -153,18 +188,23 @@ pub async fn dispatch(
 /// agent's code happens to self-report. Absent/empty header -> graceful fallback
 /// to `clientInfo.name`; both absent -> `None` (unchanged S10 behavior).
 ///
-/// (S10c) `async` because the first-connection approval gate
-/// ([`AppState::ensure_client_approved`]) may block the request on a native
-/// Win32 dialog while the user decides Allow/Deny for a never-seen identity.
-/// Only this one request's task is suspended; other clients are unaffected. On
-/// Allow (or gate-OFF) the client is recorded in `seen_clients`; on Deny the
-/// identity lands in `forbidden_clients` and the `seen_clients` record is
-/// skipped — the agent gets zero tools, but `initialize` still completes (no
-/// transport-level failure).
+/// (S15) Who the caller turns out to be decides the rest:
+/// - `Owner/label` with a known `Owner` -> a HELPER session: no approval, no
+///   record, and only the servers named in `X-Patchbay-Jacks` (none by
+///   default), never more than the owner has. See [`crate::gateway::helper`].
+/// - any other name goes through [`AppState::admit_client`]: known and
+///   forbidden identities get a session as before (a forbidden one sees
+///   nothing); a new one is recorded when the approval gate is off, and
+///   REFUSED with instructions when it is on -- no session, no dialog, no
+///   record, just an entry in the waiting list the user can act on.
+///
+/// The `instructions` string is built per caller: an agent is told its own
+/// name and how its scripts and subagents must introduce themselves; a helper
+/// is told what it was granted.
 async fn handle_initialize(
     state: &AppState,
     req: &jsonrpc::JsonRpcRequest,
-    header_client: Option<&str>,
+    init: InitHeaders<'_>,
 ) -> DispatchOutcome {
     // Prefer 2025-06-18; echo the client's version if it named a supported one.
     let client_pv = req
@@ -206,7 +246,8 @@ async fn handle_initialize(
     // tray label, the log, and the window's Agents list — shares one safe
     // value and they cannot disagree about who this is. Neither source is
     // authenticated; see `app_state::sanitize_client_name`.
-    let client_name = header_client
+    let client_name = init
+        .client
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
@@ -217,10 +258,10 @@ async fn handle_initialize(
     // no `clientInfo.name`) can never be looked up in `forbidden_clients` or
     // `client_overrides` — both are keyed by name, and `is_forbidden(None)` is
     // unconditionally `false` (see `config::schema`). With the approval gate ON,
-    // routing such a client through `ensure_client_approved` would be pointless
-    // (there is no stable name to record a Deny against — the very next
-    // anonymous connection would trip the dialog again, or worse, silently keep
-    // getting the same default-global access the gate exists to block). So while
+    // routing such a client through `admit_client` would be pointless (there is
+    // no stable name to let in or to forbid — it would wait under no name, or
+    // worse, silently keep getting the default-global access the gate exists to
+    // block). So while
     // the gate is ON, refuse to establish a session at all for an unidentified
     // client, with a message telling the agent what to send instead. This does
     // NOT affect a normal client that sends `clientInfo.name` (nearly all
@@ -241,31 +282,96 @@ async fn handle_initialize(
         return DispatchOutcome::ok(body);
     }
 
+    // (S15) Is this a helper — `Owner/label` where `Owner` is an identity we
+    // already know? An identity recorded under this EXACT name stays what it
+    // is (a client really called `org/tool` and let in before S15 is an agent,
+    // not a helper of `org`). "Known" includes forbidden: a helper of a blocked
+    // agent must be blocked with it, not treated as a stranger and offered to
+    // the user as a new agent.
+    let helper_of: Option<(String, HelperInfo)> = client_name.as_deref().and_then(|full| {
+        let cfg = state.config.read();
+        let known = |n: &str| {
+            cfg.seen_clients.iter().any(|c| c.name == n) || cfg.is_forbidden(Some(n))
+        };
+        if known(full) {
+            return None;
+        }
+        helper::split_helper(full, &known).map(|(owner, label)| {
+            (
+                owner.to_string(),
+                HelperInfo {
+                    label: label.to_string(),
+                    grant: JackGrant::parse(init.jacks),
+                },
+            )
+        })
+    });
+    let (identity, helper): (Option<String>, Option<HelperInfo>) = match helper_of {
+        Some((owner, info)) => (Some(owner), Some(info)),
+        None => (client_name, None),
+    };
+
+    // (S15) An ordinary identity goes through the door. With the approval gate
+    // ON, a name nobody has seen is refused right here — no session, no dialog,
+    // no record — with text that tells a script how to connect as a helper and
+    // tells a genuinely new agent where the user lets it in. Everything else
+    // gets a session exactly as before (a forbidden identity's session sees
+    // nothing). A helper skips the door: the user already approved its owner.
+    // (An unidentified client with the gate ON never reaches here — see above.)
+    if helper.is_none() {
+        if let Some(name) = &identity {
+            if state.admit_client(name, client_version.as_deref()) == Admission::Waiting {
+                crate::utils::request_log::log_event(
+                    state,
+                    &format!("refused unknown client '{}' (waiting for the user)", name),
+                );
+                let resp = jsonrpc::error(
+                    req.id.clone(),
+                    jsonrpc::SERVER_ERROR,
+                    helper::unknown_client_refusal(name),
+                    None,
+                );
+                let body =
+                    serde_json::to_value(resp).expect("jsonrpc error is always serializable");
+                return DispatchOutcome::ok(body);
+            }
+            // (S13) Record that this identity is STILL in use. `record_seen_client`
+            // is append-only and returns early for a known name, so without this a
+            // client that connects daily looks exactly like one that connected once
+            // in August and never again. Throttled + a no-op for an unknown or
+            // denied identity, so it cannot resurrect anything the gate refused.
+            state.touch_client_last_seen(name);
+        }
+    }
+
     let session = state.sessions.create();
     *session.protocol_version.write() = chosen.to_string();
-    session.set_client_name(client_name.clone());
+    // For a helper this is the OWNER: every per-agent rule downstream is keyed
+    // by it, so the helper is held to its owner's list without a second code
+    // path. The helper's own grant narrows that further.
+    session.set_client_name(identity.clone());
+    session.set_helper(helper.clone());
 
-    // (S10c) First-connection approval gate. For a NEW identity with the gate ON
-    // this blocks on a native Win32 dialog until the user answers (the request
-    // stays pending for just this one async task). On Allow the identity is
-    // recorded in seen_clients (with the agent's version) atomically inside the
-    // gate; on Deny it lands in forbidden_clients and is NOT recorded — the
-    // agent gets zero tools, but initialize still completes. A gate-OFF/known/
-    // forbidden identity returns immediately (gate-OFF auto-records the client —
-    // today's S10 behavior). The resolved identity (header priority, S10b)
-    // drives the record. (An unidentified client with the gate ON never reaches
-    // here — see above.)
-    if let Some(name) = &client_name {
-        state
-            .ensure_client_approved(name, client_version.as_deref())
-            .await;
-        // (S13) Record that this identity is STILL in use. `record_seen_client`
-        // is append-only and returns early for a known name, so without this a
-        // client that connects daily looks exactly like one that connected once
-        // in August and never again. Throttled + a no-op for an unknown or
-        // denied identity, so it cannot resurrect anything the gate refused.
-        state.touch_client_last_seen(name);
-    }
+    let instructions = match (&identity, &helper) {
+        (Some(owner), Some(h)) => {
+            crate::utils::log::log(&format!(
+                "initialize: helper '{}' of '{}' (granted: {})",
+                h.label,
+                owner,
+                h.grant.describe()
+            ));
+            let configured: Vec<String> = state
+                .config
+                .read()
+                .jacks
+                .iter()
+                .map(|j| j.name.clone())
+                .collect();
+            helper::helper_instructions(owner, h, &configured)
+        }
+        (Some(name), None) => helper::agent_instructions(name),
+        (None, _) => helper::BASE_INSTRUCTIONS.to_string(),
+    };
 
     let result = json!({
         "protocolVersion": chosen,
@@ -277,7 +383,7 @@ async fn handle_initialize(
             "title": "Patchbay",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Patchbay exposes upstream MCP servers as namespaced tools named <jack>__<tool>. If a tool call returns an \"unpatched\" error, the user has disabled that server in the Patchbay tray; ask them to re-enable it there."
+        "instructions": instructions
     });
 
     let body = serde_json::to_value(jsonrpc::success(req.id.clone(), result))
@@ -293,9 +399,17 @@ async fn handle_initialize(
 /// the session was not yet initialized at broadcast time, so `dirty_tools_list`
 /// was set; it is coalesced into one `list_changed` on the session's next
 /// `GET /mcp` (see `ClientSession::take_replay_since`).
-fn handle_initialized(session: Option<Arc<ClientSession>>) -> DispatchOutcome {
+fn handle_initialized(state: &AppState, session: Option<Arc<ClientSession>>) -> DispatchOutcome {
     if let Some(s) = session {
         s.initialized.store(true, Ordering::Release);
+        // (S15) A helper is recorded nowhere, so nothing else would tell the
+        // window that one just appeared under its owner. Told here rather than
+        // in `initialize`, because only an initialized session is shown.
+        if s.helper.read().is_some() {
+            if let Some(display) = s.display_name() {
+                state.note_helper_connected(&display);
+            }
+        }
     }
     DispatchOutcome::accepted()
 }
@@ -327,6 +441,14 @@ fn handle_tools_list(
     let client_name: Option<String> = session
         .as_ref()
         .and_then(|s| s.client_name.read().clone());
+    // (S15) A helper's `client_name` is its OWNER, so `effective_patched` below
+    // already limits it to what the owner has; `granted` narrows that to the
+    // servers the helper asked for (none by default). For an ordinary agent
+    // there is no grant and nothing is narrowed.
+    let grant: Option<JackGrant> = session
+        .as_ref()
+        .and_then(|s| s.helper.read().as_ref().map(|h| h.grant.clone()));
+    let granted = |jack: &str| grant.as_ref().map(|g| g.allows(jack)).unwrap_or(true);
     // Build the per-client effective patched set under one config read lock.
     // (S10c) A forbidden client's effective_patched is false for every jack, so
     // effective_names is empty for it — and we additionally withhold the
@@ -337,7 +459,9 @@ fn handle_tools_list(
         let names = cfg
             .jacks
             .iter()
-            .filter(|j| cfg.effective_patched(&j.name, client_name.as_deref()))
+            .filter(|j| {
+                cfg.effective_patched(&j.name, client_name.as_deref()) && granted(&j.name)
+            })
             .map(|j| j.name.clone())
             .collect();
         (forbidden, names)
@@ -358,7 +482,9 @@ fn handle_tools_list(
     //
     // (S10c) A forbidden client sees NOTHING — no jack tools (effective_patched
     // already hid them) and no meta tools either.
-    if !forbidden {
+    // (S15) A helper gets the meta tools only when it was granted `patchbay`
+    // (or everything): "nothing by default" includes Patchbay's own tools.
+    if !forbidden && granted(helper::META_TOOLS_GRANT) {
         for tool in builtin_admin_tools() {
             tools_out.push(tool);
         }
@@ -422,6 +548,28 @@ async fn handle_tools_call(
         }
     }
 
+    // (S15) What this session was granted, if it is a helper. Snapshotted once;
+    // a grant is fixed at `initialize` and never changes for a session.
+    let helper_info: Option<HelperInfo> = session.as_ref().and_then(|s| s.helper.read().clone());
+    let owner_name = client_name.as_deref().unwrap_or("its owner");
+
+    // (S15) The gateway's own tools are granted like a server's: a helper that
+    // did not ask for `patchbay` cannot list, add, remove or switch off jacks.
+    if let Some(h) = &helper_info {
+        let is_meta = matches!(
+            name,
+            BUILTIN_ADD_JACK | BUILTIN_REMOVE_JACK | BUILTIN_LIST_JACKS | BUILTIN_TOGGLE_JACK
+        );
+        if is_meta && !h.grant.allows(helper::META_TOOLS_GRANT) {
+            let text = helper::not_granted_text(
+                owner_name,
+                &h.label,
+                "Patchbay's own management tools (name `patchbay` in that header to get them)",
+            );
+            return call_tool_result(req, call_tool_error_result(&text));
+        }
+    }
+
     // (S8) Gateway-owned meta tools: intercept by EXACT name BEFORE the
     // `<jack>__<tool>` namespace split. These names contain `__` but belong to
     // no upstream jack — they must never be forwarded upstream. (There is no
@@ -459,6 +607,20 @@ async fn handle_tools_call(
                 .unwrap_or(false);
         (eff, client_specific)
     };
+
+    // (S15) A helper that was not granted this server is told so, and told how
+    // to ask — before the owner's own state is looked at, so the answer does
+    // not reveal whether the owner has a server the helper was never given.
+    if let Some(h) = &helper_info {
+        if !h.grant.allows(&jack) {
+            let text = helper::not_granted_text(
+                owner_name,
+                &h.label,
+                &format!("the server '{}'", jack),
+            );
+            return call_tool_result(req, call_tool_error_result(&text));
+        }
+    }
 
     // (2) Known but effectively UNPATCHED for this client -> model-directed
     // CallToolResult error (wording reflects whether a per-agent override is the
@@ -1580,6 +1742,278 @@ mod tests {
         .await;
         assert!(!err, "adding a switched-off definition must remain possible");
         assert_eq!(st.config.read().jacks.len(), before + 1);
+        config::set_test_config_path(None);
+    }
+
+    // ---- S15: helpers, and the door for unknown names ----
+
+    /// `prod` patched ON, the approval gate ON, and one known agent, "Codex".
+    /// No upstream is ever started.
+    fn state_with_known_agent() -> AppState {
+        let mut cfg = first_run_template();
+        cfg.jacks[0].patched = true;
+        cfg.require_approval_for_new_clients = true;
+        cfg.seen_clients.push(config::SeenClient {
+            name: "Codex".to_string(),
+            first_seen_version: None,
+            first_seen: String::new(),
+            last_seen: None,
+        });
+        AppState::new(cfg)
+    }
+
+    /// `initialize` the way a script does it: an invented `clientInfo.name`,
+    /// with the two Patchbay headers saying who it really is.
+    async fn initialize_as(st: &AppState, client: &str, jacks: Option<&str>) -> DispatchOutcome {
+        let r = init_req_with_client_info("whatever-the-script-says", Some("1"));
+        dispatch_with(
+            st,
+            &r,
+            None,
+            InitHeaders {
+                client: Some(client),
+                jacks,
+            },
+        )
+        .await
+    }
+
+    fn tool_names(outcome: DispatchOutcome) -> Vec<String> {
+        outcome.body.unwrap()["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    fn call_text(outcome: DispatchOutcome) -> String {
+        let body = outcome.body.unwrap();
+        assert_eq!(body["result"]["isError"], true, "expected model-directed text: {}", body);
+        body["result"]["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_helper_of_a_known_agent_gets_in_and_leaves_no_record() {
+        config::set_test_config_path(Some(config::fresh_test_config_path()));
+        let st = state_with_known_agent();
+
+        let outcome = initialize_as(&st, "Codex/bee-script", None).await;
+        let sid = outcome
+            .new_session_id
+            .clone()
+            .expect("a helper of a known agent needs no approval");
+        let session = st.sessions.get(&sid).unwrap();
+        // Enforcement goes by the OWNER; the label is carried beside it.
+        assert_eq!(session.client_name.read().as_deref(), Some("Codex"));
+        assert_eq!(session.helper.read().as_ref().unwrap().label, "bee-script");
+        assert_eq!(session.display_name().as_deref(), Some("Codex/bee-script"));
+
+        // Nothing was written anywhere: that is the point.
+        {
+            let cfg = st.config.read();
+            assert_eq!(cfg.seen_clients.len(), 1, "a helper is not a new agent");
+            assert!(cfg.forbidden_clients.is_empty());
+        }
+        assert!(st.knocks_snapshot().is_empty(), "and it is not kept waiting");
+
+        let body = outcome.body.unwrap();
+        let text = body["result"]["instructions"].as_str().unwrap();
+        assert!(text.contains("helper 'bee-script' of 'Codex'"), "got: {}", text);
+        assert!(text.contains("NO servers"), "got: {}", text);
+        config::set_test_config_path(None);
+    }
+
+    #[tokio::test]
+    async fn a_helper_gets_nothing_unless_it_asks() {
+        // The default the owner asked for: a forgotten header is no access,
+        // not all of it.
+        let st = state_with_known_agent();
+        let sid = initialize_as(&st, "Codex/probe", None).await.new_session_id.unwrap();
+        let session = st.sessions.get(&sid).unwrap();
+
+        let list = dispatch(&st, &req("tools/list", Some(json!(3))), Some(session.clone()), None).await;
+        assert!(tool_names(list).is_empty(), "no jack tools and no meta tools");
+
+        let text = call_text(dispatch(&st, &req_call("prod__query"), Some(session.clone()), None).await);
+        assert!(text.contains("helper 'probe' of 'Codex'"), "got: {}", text);
+        assert!(text.contains("X-Patchbay-Jacks"), "the refusal must say how to ask: {}", text);
+
+        // Patchbay's own tools are part of "nothing".
+        let text = call_text(dispatch(&st, &req_call(BUILTIN_LIST_JACKS), Some(session), None).await);
+        assert!(text.contains("`patchbay`"), "got: {}", text);
+    }
+
+    #[tokio::test]
+    async fn a_helper_gets_exactly_what_it_was_granted() {
+        let st = state_with_known_agent();
+
+        // Named `patchbay`: the meta tools, and nothing else.
+        let sid = initialize_as(&st, "Codex/admin", Some("patchbay")).await.new_session_id.unwrap();
+        let session = st.sessions.get(&sid).unwrap();
+        let names = tool_names(dispatch(&st, &req("tools/list", Some(json!(3))), Some(session.clone()), None).await);
+        assert!(names.contains(&BUILTIN_LIST_JACKS.to_string()), "names: {:?}", names);
+        let text = call_text(dispatch(&st, &req_call("prod__query"), Some(session), None).await);
+        assert!(text.contains("was not granted the server 'prod'"), "got: {}", text);
+
+        // Named `prod`: the call gets past the grant AND past the owner's list,
+        // and stops only because no upstream is running in this test.
+        let sid = initialize_as(&st, "Codex/worker", Some("prod")).await.new_session_id.unwrap();
+        let session = st.sessions.get(&sid).unwrap();
+        let text = call_text(dispatch(&st, &req_call("prod__query"), Some(session.clone()), None).await);
+        assert!(text.contains("not running"), "got: {}", text);
+        let names = tool_names(dispatch(&st, &req("tools/list", Some(json!(3))), Some(session), None).await);
+        assert!(names.is_empty(), "`prod` alone does not bring the meta tools: {:?}", names);
+
+        // `*`: everything the owner has, the meta tools included.
+        let sid = initialize_as(&st, "Codex/all", Some("*")).await.new_session_id.unwrap();
+        let session = st.sessions.get(&sid).unwrap();
+        let names = tool_names(dispatch(&st, &req("tools/list", Some(json!(3))), Some(session), None).await);
+        assert!(names.contains(&BUILTIN_TOGGLE_JACK.to_string()), "names: {:?}", names);
+    }
+
+    #[tokio::test]
+    async fn a_helper_can_never_reach_what_its_owner_cannot() {
+        // The hole this closes: a script used to get in under an invented name
+        // and land on the GLOBAL list, past its owner's own restrictions.
+        use crate::config::ClientOverride;
+        use std::collections::BTreeMap;
+        let st = state_with_known_agent();
+        {
+            let mut jacks = BTreeMap::new();
+            jacks.insert("prod".to_string(), false); // prod is ON globally, OFF for Codex
+            st.config.write().client_overrides.insert(
+                "Codex".to_string(),
+                ClientOverride {
+                    enabled: true,
+                    jacks,
+                },
+            );
+        }
+
+        // Even asking for everything, the helper is held to Codex's list.
+        let sid = initialize_as(&st, "Codex/script", Some("*")).await.new_session_id.unwrap();
+        let session = st.sessions.get(&sid).unwrap();
+        let text = call_text(dispatch(&st, &req_call("prod__query"), Some(session), None).await);
+        assert!(
+            text.contains("disabled for THIS agent ('Codex')"),
+            "the owner's own list must decide: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn a_helper_of_a_forbidden_agent_is_blocked_with_it() {
+        // "rogue" is forbidden and was never recorded as seen. Its helper must
+        // not be taken for a stranger and offered to the user as a new agent.
+        let st = state_with_forbidden_client();
+        st.config.write().require_approval_for_new_clients = true;
+
+        let sid = initialize_as(&st, "rogue/script", Some("*"))
+            .await
+            .new_session_id
+            .expect("a forbidden identity still gets a session that sees nothing");
+        let session = st.sessions.get(&sid).unwrap();
+        assert_eq!(session.client_name.read().as_deref(), Some("rogue"));
+
+        let list = dispatch(&st, &req("tools/list", Some(json!(3))), Some(session.clone()), None).await;
+        assert!(tool_names(list).is_empty());
+        let text = call_text(dispatch(&st, &req_call("prod__query"), Some(session), None).await);
+        assert!(text.contains("blocked by the user"), "got: {}", text);
+
+        assert!(st.knocks_snapshot().is_empty());
+        assert!(st.config.read().seen_clients.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_name_is_refused_with_instructions_when_the_gate_is_on() {
+        let st = state_with_known_agent();
+
+        let outcome = initialize_as(&st, "orchestrator", None).await;
+        assert!(outcome.new_session_id.is_none(), "no session for a refused name");
+        let body = outcome.body.unwrap();
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("'orchestrator'"), "got: {}", msg);
+        assert!(
+            msg.contains("X-Patchbay-Client: <owner>/<short-label>"),
+            "a script must be told how to introduce itself: {}",
+            msg
+        );
+
+        // No permanent trace, whichever way the user would have answered.
+        {
+            let cfg = st.config.read();
+            assert_eq!(cfg.seen_clients.len(), 1);
+            assert!(cfg.forbidden_clients.is_empty());
+        }
+        let knocks = st.knocks_snapshot();
+        assert_eq!(knocks.len(), 1);
+        assert_eq!(knocks[0].name, "orchestrator");
+        assert_eq!(knocks[0].version.as_deref(), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn a_helper_of_an_unknown_owner_is_just_an_unknown_name() {
+        let st = state_with_known_agent();
+        let outcome = initialize_as(&st, "Nobody/script", Some("*")).await;
+        assert!(outcome.new_session_id.is_none());
+        assert_eq!(st.knocks_snapshot()[0].name, "Nobody/script");
+    }
+
+    #[tokio::test]
+    async fn a_waiting_name_gets_in_once_the_user_allows_it() {
+        config::set_test_config_path(Some(config::fresh_test_config_path()));
+        let st = state_with_known_agent();
+        assert!(initialize_as(&st, "Gemini-CLI", None).await.new_session_id.is_none());
+
+        st.approve_knock("Gemini-CLI").unwrap();
+
+        let outcome = initialize_as(&st, "Gemini-CLI", None).await;
+        assert!(outcome.new_session_id.is_some(), "allowed by the user, so it connects");
+        config::set_test_config_path(None);
+    }
+
+    #[tokio::test]
+    async fn a_separator_does_not_make_a_helper_out_of_a_real_agent() {
+        config::set_test_config_path(Some(config::fresh_test_config_path()));
+
+        // Gate OFF, owner unknown: `@scope/tool` is recorded as the ordinary
+        // agent it claims to be (unchanged S10 behavior), with the global list.
+        let st = state();
+        let sid = initialize_as(&st, "@scope/tool", None).await.new_session_id.unwrap();
+        let session = st.sessions.get(&sid).unwrap();
+        assert_eq!(session.client_name.read().as_deref(), Some("@scope/tool"));
+        assert!(session.helper.read().is_none());
+        assert!(st.config.read().seen_clients.iter().any(|c| c.name == "@scope/tool"));
+
+        // An identity already recorded under a name with a separator stays an
+        // agent even when its prefix is also a known agent.
+        let st = state_with_known_agent();
+        st.config.write().seen_clients.push(config::SeenClient {
+            name: "Codex/legacy".to_string(),
+            first_seen_version: None,
+            first_seen: String::new(),
+            last_seen: None,
+        });
+        let sid = initialize_as(&st, "Codex/legacy", None).await.new_session_id.unwrap();
+        let session = st.sessions.get(&sid).unwrap();
+        assert_eq!(session.client_name.read().as_deref(), Some("Codex/legacy"));
+        assert!(session.helper.read().is_none());
+        config::set_test_config_path(None);
+    }
+
+    #[tokio::test]
+    async fn an_agent_is_told_its_own_name_and_the_rule_for_its_helpers() {
+        config::set_test_config_path(Some(config::fresh_test_config_path()));
+        let st = state_with_known_agent();
+        let outcome = initialize_as(&st, "Codex", None).await;
+        let body = outcome.body.unwrap();
+        let text = body["result"]["instructions"].as_str().unwrap();
+        assert!(
+            text.contains("X-Patchbay-Client: Codex/<short-label>"),
+            "the agent cannot follow a rule it was never told: {}",
+            text
+        );
         config::set_test_config_path(None);
     }
 }

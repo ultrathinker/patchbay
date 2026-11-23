@@ -40,6 +40,8 @@ pub struct UiSnapshot {
     pub gateway: UiGateway,
     pub jacks: Vec<UiJack>,
     pub agents: Vec<UiAgent>,
+    /// (S15) Identities that tried to connect and are waiting to be let in.
+    pub knocks: Vec<UiKnock>,
     pub settings: UiSettings,
 }
 
@@ -51,7 +53,8 @@ pub struct UiGateway {
     pub error: Option<String>,
     pub port: u16,
     pub url: String,
-    /// Live, initialized MCP sessions right now.
+    /// Live, initialized MCP sessions right now. Helper sessions are not
+    /// counted: the header reads "N agents connected", and a script is not one.
     pub session_count: usize,
     /// A config-file parse/IO error surfaced to the user, if any. Rendered as a
     /// persistent strip, not a toast: it does not go away by itself.
@@ -115,7 +118,38 @@ pub struct UiAgent {
     /// dimmed when `custom_state != Enabled`.
     pub overrides: Vec<UiAgentJack>,
     pub denied: bool,
+    /// (S15) Scripts and subagents connected on this agent's behalf right now
+    /// (`Owner/label`), most recently active first. Never persisted.
+    pub helpers: Vec<UiHelper>,
 }
+
+/// (S15) One live helper of an agent. See [`crate::gateway::helper`].
+#[derive(Serialize, Clone, Debug)]
+pub struct UiHelper {
+    pub label: String,
+    /// What it asked its owner for: `*`, `a, b`, or `none`.
+    pub jacks: String,
+    /// Seconds since its most recent activity.
+    pub idle_secs: u64,
+    /// Live sessions under this label with this grant.
+    pub sessions: usize,
+}
+
+/// (S15) One identity waiting to be let in as a new agent.
+#[derive(Serialize, Clone, Debug)]
+pub struct UiKnock {
+    pub name: String,
+    pub version: Option<String>,
+    /// RFC3339, the most recent attempt.
+    pub last_seen: String,
+    /// How many times it has tried.
+    pub count: u32,
+}
+
+/// (S15) A helper session stays in the registry until it is reaped, a day
+/// after its last request, because a script rarely bothers to close it. The
+/// window lists helpers that are at work, not ones that finished this morning.
+pub const HELPER_VISIBLE_SECS: u64 = 15 * 60;
 
 #[derive(Serialize, Clone, Debug)]
 pub struct UiAgentJack {
@@ -165,7 +199,7 @@ fn split_status(status: &str) -> (String, Option<String>) {
 /// strings, and never touches the disk or an upstream process.
 pub fn build_snapshot(state: &AppState, version: &str) -> UiSnapshot {
     let live = state.sessions.snapshot();
-    let session_count = live.len();
+    let session_count = live.iter().filter(|s| s.helper.is_none()).count();
 
     let (status, error, port) = {
         let cfg_port = state.config.read().port;
@@ -219,14 +253,42 @@ pub fn build_snapshot(state: &AppState, version: &str) -> UiSnapshot {
     // One identity may hold several live sessions (an agent that reconnected
     // without closing the old one). Keep the freshest.
     let mut idle_by_name: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    // (S15) A helper session carries its OWNER's name, but it is not the owner
+    // being connected: it goes into the owner's helper list instead, one row
+    // per label + grant, and only while it is recently active.
+    let mut helpers_by_owner: std::collections::HashMap<String, Vec<UiHelper>> =
+        std::collections::HashMap::new();
     for s in &live {
-        if let Some(name) = &s.client_name {
-            let secs = s.idle.as_secs();
-            idle_by_name
-                .entry(name.clone())
-                .and_modify(|e| *e = (*e).min(secs))
-                .or_insert(secs);
+        let Some(name) = &s.client_name else { continue };
+        let secs = s.idle.as_secs();
+        match &s.helper {
+            None => {
+                idle_by_name
+                    .entry(name.clone())
+                    .and_modify(|e| *e = (*e).min(secs))
+                    .or_insert(secs);
+            }
+            Some(h) if secs <= HELPER_VISIBLE_SECS => {
+                let jacks = h.grant.describe();
+                let rows = helpers_by_owner.entry(name.clone()).or_default();
+                match rows.iter_mut().find(|r| r.label == h.label && r.jacks == jacks) {
+                    Some(row) => {
+                        row.idle_secs = row.idle_secs.min(secs);
+                        row.sessions += 1;
+                    }
+                    None => rows.push(UiHelper {
+                        label: h.label.clone(),
+                        jacks,
+                        idle_secs: secs,
+                        sessions: 1,
+                    }),
+                }
+            }
+            Some(_) => {}
         }
+    }
+    for rows in helpers_by_owner.values_mut() {
+        rows.sort_by(|a, b| a.idle_secs.cmp(&b.idle_secs).then_with(|| a.label.cmp(&b.label)));
     }
 
     let mut agents: Vec<UiAgent> = cfg
@@ -271,15 +333,17 @@ pub fn build_snapshot(state: &AppState, version: &str) -> UiSnapshot {
                 custom_state,
                 overrides,
                 denied: cfg.forbidden_clients.iter().any(|f| *f == c.name),
+                helpers: helpers_by_owner.get(&c.name).cloned().unwrap_or_default(),
             }
         })
         .collect();
 
     // Denied identities that were NEVER recorded as seen still have to appear,
-    // or the user cannot un-deny them. `apply_approval_decision` writes a Deny
-    // to `forbidden_clients` and NEVER to `seen_clients`, so such an identity
-    // has no record and no `first_seen` — plan v1's mock showed it a date that
-    // cannot exist. They render with no history at all.
+    // or the user cannot un-deny them. Before S15 a Deny in the approval dialog
+    // wrote to `forbidden_clients` and NEVER to `seen_clients`, and a config
+    // edited by hand can do the same, so such an identity has no record and no
+    // `first_seen` — plan v1's mock showed it a date that cannot exist. They
+    // render with no history at all.
     for denied in cfg.forbidden_clients.iter() {
         if !agents.iter().any(|a| a.name == *denied) {
             agents.push(UiAgent {
@@ -292,6 +356,9 @@ pub fn build_snapshot(state: &AppState, version: &str) -> UiSnapshot {
                 custom_state: UiCustomState::None,
                 overrides: Vec::new(),
                 denied: true,
+                // A forbidden owner's helpers see nothing; listing them would
+                // suggest otherwise.
+                helpers: Vec::new(),
             });
         }
     }
@@ -305,10 +372,27 @@ pub fn build_snapshot(state: &AppState, version: &str) -> UiSnapshot {
         version: version.to_string(),
     };
 
+    drop(cfg);
+
+    // (S15) Newest first: the name the user was just told about is the one
+    // they are looking for.
+    let knocks: Vec<UiKnock> = state
+        .knocks_snapshot()
+        .into_iter()
+        .rev()
+        .map(|k| UiKnock {
+            name: k.name,
+            version: k.version,
+            last_seen: k.last_seen,
+            count: k.count,
+        })
+        .collect();
+
     UiSnapshot {
         gateway,
         jacks,
         agents,
+        knocks,
         settings,
     }
 }
@@ -389,6 +473,21 @@ pub async fn ui_set_forbidden(app: AppHandle, agent: String, denied: bool) -> Re
 pub async fn ui_delete_agents(app: AppHandle, names: Vec<String>) -> Result<u64, String> {
     let state = state_of(&app)?;
     Ok(state.delete_agents(&names).await)
+}
+
+/// (S15) Let a waiting identity in as a new agent.
+#[tauri::command]
+pub fn ui_approve_knock(app: AppHandle, name: String) -> Result<(), String> {
+    let state = state_of(&app)?;
+    state.approve_knock(&name)
+}
+
+/// (S15) Forget a waiting identity without letting it in.
+#[tauri::command]
+pub fn ui_dismiss_knock(app: AppHandle, name: String) -> Result<(), String> {
+    let state = state_of(&app)?;
+    state.dismiss_knock(&name);
+    Ok(())
 }
 
 #[tauri::command]
@@ -862,5 +961,75 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "contrast failures:\n{}", failures.join("\n"));
+    }
+
+    // ---- S15: helpers and the waiting list ----
+
+    fn state_with_agent(name: &str) -> AppState {
+        let mut cfg = first_run_template();
+        cfg.seen_clients.push(crate::config::SeenClient {
+            name: name.to_string(),
+            first_seen_version: None,
+            first_seen: String::new(),
+            last_seen: None,
+        });
+        AppState::new(cfg)
+    }
+
+    #[test]
+    fn a_helper_is_listed_under_its_owner_and_is_not_the_owner_connecting() {
+        use crate::gateway::helper::{HelperInfo, JackGrant};
+        let state = state_with_agent("Codex");
+        let session = state.sessions.create();
+        session.set_client_name(Some("Codex".to_string()));
+        session.set_helper(Some(HelperInfo {
+            label: "bee-script".to_string(),
+            grant: JackGrant::parse(Some("limits")),
+        }));
+        state.sessions.mark_initialized(&session.id);
+
+        let snap = build_snapshot(&state, "1.5.0");
+        let codex = snap.agents.iter().find(|a| a.name == "Codex").unwrap();
+        // A script running is not the agent being connected.
+        assert!(!codex.connected);
+        assert_eq!(snap.gateway.session_count, 0, "a helper is not an agent");
+        assert_eq!(codex.helpers.len(), 1);
+        assert_eq!(codex.helpers[0].label, "bee-script");
+        assert_eq!(codex.helpers[0].jacks, "limits");
+        assert_eq!(codex.helpers[0].sessions, 1);
+    }
+
+    #[test]
+    fn two_sessions_of_one_helper_are_one_row() {
+        use crate::gateway::helper::{HelperInfo, JackGrant};
+        let state = state_with_agent("Codex");
+        for _ in 0..2 {
+            let session = state.sessions.create();
+            session.set_client_name(Some("Codex".to_string()));
+            session.set_helper(Some(HelperInfo {
+                label: "loop".to_string(),
+                grant: JackGrant::All,
+            }));
+            state.sessions.mark_initialized(&session.id);
+        }
+        let snap = build_snapshot(&state, "1.5.0");
+        let codex = snap.agents.iter().find(|a| a.name == "Codex").unwrap();
+        assert_eq!(codex.helpers.len(), 1);
+        assert_eq!(codex.helpers[0].sessions, 2);
+        assert_eq!(codex.helpers[0].jacks, "*");
+    }
+
+    #[test]
+    fn the_waiting_list_reaches_the_window_newest_first() {
+        let state = state_with_agent("Codex");
+        state.record_knock("probe", None);
+        state.record_knock("orchestrator", Some("1"));
+
+        let snap = build_snapshot(&state, "1.5.0");
+        let names: Vec<&str> = snap.knocks.iter().map(|k| k.name.as_str()).collect();
+        assert_eq!(names, ["orchestrator", "probe"]);
+        assert_eq!(snap.knocks[0].version.as_deref(), Some("1"));
+        // Waiting is not being an agent.
+        assert!(!snap.agents.iter().any(|a| a.name == "probe"));
     }
 }

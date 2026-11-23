@@ -5,6 +5,7 @@
 //! it logs, records a `Failed` status, and returns (never panics).
 
 pub mod handlers;
+pub mod helper;
 pub mod http;
 pub mod jsonrpc;
 pub mod policy;

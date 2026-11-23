@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-11-23
+
+Scripts and subagents stop becoming "agents". An agent's own script had to put
+some name into the MCP handshake, nothing told it which, so it invented one —
+`probe`, `orchestrator`, `bee-put`. With the approval gate on, every invented
+name raised a system-wide dialog and then stayed for good: in the agent list on
+Yes, in the forbidden list on No. One machine had collected 34 "agents" this
+way, about half of them such scripts.
+
+### Added
+- **Helpers.** A script or subagent connects as `Owner/label` in the
+  `X-Patchbay-Client` header (or in `clientInfo.name`). When `Owner` is an agent
+  Patchbay already knows, the session is a helper of that agent: nobody is
+  asked, nothing is recorded, and it is listed under its owner in the window
+  only while it is connected. Both platforms.
+- **A helper gets nothing by default.** Its owner hands servers over
+  deliberately, with a second header on `initialize`:
+  `X-Patchbay-Jacks: bee-memory-bank, limits`, or `*` for all of the owner's
+  (`patchbay` in the list grants the `patchbay__*` tools). A helper without the
+  header sees no tools at all, and a call tells it how to ask.
+- **Patchbay tells each agent the rule.** The `instructions` returned by
+  `initialize` are now written for the caller: an agent is told the name it is
+  connected under — which it could not know, since the name sits in a config
+  header the model never sees — and the two headers its scripts and subagents
+  must send; a helper is told what it was granted.
+- **"Waiting to be let in".** With "Require approval for new agents" on, an
+  identity Patchbay has never seen is listed at the top of the window's Agents
+  screen with Allow and Dismiss, and in the tray menu as "New agents waiting
+  [N]". The tray tooltip says when someone is waiting. The list lives in memory
+  only and holds the 20 most recent names.
+
+### Changed
+- **The approval dialog is gone.** With the approval gate on, an unknown
+  identity is now refused at `initialize` with a message that says how to
+  connect — as a helper of its owner, or, for a real new agent, where the user
+  lets it in. Nothing blocks, nothing pops up over other applications, and
+  nothing is written about a name you do not let in. A new agent you allow
+  connects on its next attempt. With the gate off (the default) nothing changes:
+  a new name is recorded on first contact, as before.
+- The header of the window counts agents, not sessions: a helper running is not
+  an agent connected.
+
+### Fixed
+- **A script could reach servers its author was denied.** A name invented by a
+  script, once allowed, had no permission list of its own and so got the global
+  one — including servers switched off for the agent that wrote it. A helper is
+  held to its owner's list on every request and to the servers it was granted
+  on top of that, so it can never reach more than its owner.
+
 ## [1.4.1] — 2026-11-08
 
 ### Fixed

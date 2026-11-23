@@ -60,6 +60,8 @@ fn main() {
             ui::ui_set_forbidden_batch,
             ui::ui_delete_agents,
             ui::ui_undo,
+            ui::ui_approve_knock,
+            ui::ui_dismiss_knock,
             ui::ui_set_autostart,
             ui::ui_set_require_approval,
             ui::ui_set_request_logging,

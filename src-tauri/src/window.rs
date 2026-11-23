@@ -349,34 +349,6 @@ fn ensure_popover(app: &AppHandle) -> Result<tauri::WebviewWindow, tauri::Error>
     Ok(window)
 }
 
-/// (S13 §4.7) Step out of the way of a blocking Win32 dialog.
-///
-/// The first-connection approval prompt is a `MessageBoxW`. The popover is
-/// always-on-top, so a dialog raised while it is open can be painted BEHIND it
-/// — and since the dialog is modal to its own thread, the result looks exactly
-/// like a frozen machine: a window that will not respond and a dialog the user
-/// cannot see or reach.
-///
-/// Called around any blocking native dialog. Idempotent and safe when no window
-/// exists (the common case: `ui_mode = "tray"`).
-pub fn set_yielding(app: &AppHandle, yielding: bool) {
-    if let Some(w) = app.get_webview_window(POPOVER_LABEL) {
-        if yielding {
-            // Hiding, not merely un-topmosting: an approval prompt is a
-            // question about a NEW agent, and the popover's own contents are
-            // about to be invalidated by the answer anyway.
-            if let Err(e) = w.set_always_on_top(false) {
-                log(&format!("popover: clearing always-on-top failed: {}", e));
-            }
-            if let Err(e) = w.hide() {
-                log(&format!("popover: hide-for-dialog failed: {}", e));
-            }
-        } else if let Err(e) = w.set_always_on_top(true) {
-            log(&format!("popover: restoring always-on-top failed: {}", e));
-        }
-    }
-}
-
 /// Hide the popover if it exists. Never destroys it (W-D6).
 pub fn hide_popover(app: &AppHandle) {
     if let Some(w) = app.get_webview_window(POPOVER_LABEL) {

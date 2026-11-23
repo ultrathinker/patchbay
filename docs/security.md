@@ -64,18 +64,53 @@ machine is assumed trusted at the OS level; the identity layer is for
 
 On top of identity:
 
-- **Approval gate** (off by default): the first time a *never-seen* identity
-  connects, a native Allow/Deny dialog blocks `initialize` until you decide —
-  `MessageBoxW` on Windows, an AppleScript `display dialog` run by
-  `/usr/bin/osascript` on macOS. Allow remembers it; Deny adds it to the
-  Forbidden list. The gate **fails
-  closed** — a client that sends neither `X-Patchbay-Client` nor
-  `clientInfo.name` is rejected outright (such a client can never match the
-  Forbidden list, so it cannot be allowed to slip through with default-global
-  access).
+- **Approval gate** (off by default): a *never-seen* identity is refused at
+  `initialize` — no session, no tools — and waits in an in-memory list until
+  you let it in from the window (Agents → Waiting to be let in) or the tray menu
+  (New agents waiting). Nothing is written for an identity you do not let in,
+  and the list holds at most 20 names. The refusal carries instructions the
+  caller can act on (see Helpers below). Until 1.5.0 this was a system-modal
+  Allow/Deny dialog that blocked `initialize`, and both of its answers left a
+  permanent record. The gate **fails closed** — a client that sends neither
+  `X-Patchbay-Client` nor `clientInfo.name` is rejected outright (such a client
+  can never match the Forbidden list, so it cannot be allowed to slip through
+  with default-global access).
 - **Forbidden list**: deny an identity entirely; every request is rejected.
 - **Custom permissions**: give an agent its own on/off list independent of the
   global checkboxes.
+
+### Helpers: scripts and subagents (S15)
+
+An agent's own scripts and subagents reach the gateway on their own
+connections. Before 1.5.0 each of them had to put *something* in
+`clientInfo.name`, picked an arbitrary name, and — once allowed — had no
+permission list of its own, so it fell back to the **global** list. A script
+written by an agent that had been denied a server could therefore reach that
+server.
+
+A caller now declares its owner: `X-Patchbay-Client: Owner/label`. When `Owner`
+is a known identity (seen or forbidden) and the full string is not itself a
+recorded identity, the session is a *helper*:
+
+- its enforcement identity is the **owner** — the same `effective_patched`
+  lookup, the same Custom list, the same forbidden gate;
+- on top of that it is limited to the jacks named in the `X-Patchbay-Jacks`
+  header of its `initialize` (comma-separated names, or `*`; `patchbay` stands
+  for the gateway's own meta tools). An absent header grants nothing. The check
+  is an intersection evaluated on every request, so it can only narrow;
+- it is never written to `seen_clients`, never trips the approval gate, and is
+  visible only as a live session under its owner.
+
+A name whose prefix is not a known identity is an ordinary name and takes the
+ordinary path, so a real client called `@scope/tool` is unaffected.
+
+This is not a boundary against a hostile local process, for the reason given
+above: such a process could always claim the owner's bare name and get the
+owner's whole list. What it guarantees is that the cooperative path — the one
+an agent's own script takes — no longer widens access or grows the agent list.
+The rule is stated to the caller itself: `initialize` returns per-caller
+`instructions` (an agent is told its own name and the two headers; a helper is
+told what it was granted), and the approval gate's refusal repeats them.
 
 ## Logging & secret redaction
 
@@ -170,10 +205,11 @@ back, so an existing jack's secret cannot be read out of the UI.
 
 ## Native dialogs — the identity string and AppleScript (macOS)
 
-The approval dialog and the "delete agent" confirmation show the agent's
-identity, which is attacker-controlled text (see above). On Windows it is passed
-to `MessageBoxW` as a plain wide string. On macOS the dialogs are AppleScript
-`display dialog` calls run through `/usr/bin/osascript`, which would make the
+The "delete agent" confirmation shows the agent's identity, which is
+attacker-controlled text (see above). (Until 1.5.0 the approval gate had a
+dialog of the same kind; it no longer has one.) On Windows it is passed
+to `MessageBoxW` as a plain wide string. On macOS the dialog is an AppleScript
+`display dialog` call run through `/usr/bin/osascript`, which would make the
 identity a string literal inside a script — a quote or backslash in a crafted
 name could otherwise break out of the literal and add AppleScript of its own.
 So the identity is **escaped for AppleScript** before it is placed in the
@@ -182,10 +218,9 @@ dropped, and line breaks become `& return &`, so nothing in the name can end the
 string literal. (This sits on top of the source-level sanitizing above; neither
 layer is relied on alone.)
 
-Both dialogs run on a plain thread, never on the async runtime or the UI thread,
-and fail safe: dismissing the dialog, pressing Escape, or a failure to show it
-counts as **Deny** for the approval gate and as **Cancel** for deletion — and the
-delete confirmation's default button is Cancel, so a stray Return deletes
+The dialog runs on a plain thread, never on the async runtime or the UI thread,
+and fails safe: dismissing it, pressing Escape, or a failure to show it counts
+as **Cancel** — and its default button is Cancel, so a stray Return deletes
 nothing.
 
 ## Who may switch a server on (S14)
@@ -202,7 +237,7 @@ reach. Two paths let a caller decide it for themselves:
 Either path could switch a server back on that the user had switched off —
 including a production database server — and Patchbay would start it and hand
 over the tools, deciding over the Custom lists, the forbidden gate and the
-approval dialog alike.
+approval gate alike.
 
 One rule now covers both, in `gateway/policy.rs`:
 

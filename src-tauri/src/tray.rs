@@ -43,6 +43,8 @@ const ID_OPEN_LOGS: &str = "open_logs";
 const ID_COPY_URL: &str = "copy_url";
 const ID_ABOUT: &str = "about";
 const ID_QUIT: &str = "quit";
+/// (S15) "Dismiss all" in the "New agents waiting" submenu.
+const ID_KNOCK_DISMISS_ALL: &str = "knock_dismiss_all";
 /// (S13) "Show window" — present only in the MINIMAL menu that `ui_mode =
 /// "window"` puts on the right button, so the popover is reachable even if the
 /// user forgets that a left click opens it.
@@ -149,6 +151,10 @@ pub struct TrayItems {
     pub delete_client: Mutex<HashMap<String, DeleteClientItem>>,
     /// Monotonic counter for delete-client menu ids (reset each rebuild).
     pub delete_client_counter: Mutex<u64>,
+    /// (S15) "Allow '<name>'" items of the "New agents waiting" submenu, keyed
+    /// by opaque menu id (`"knock:<n>"`) -> the waiting identity that entry
+    /// lets in. Refilled on every rebuild.
+    pub knocks: Mutex<HashMap<String, String>>,
     /// macOS, `window`/`both` mode: the right-button menu, kept here rather
     /// than on the icon. AppKit opens a status item's menu on EVERY click while
     /// one is attached, whatever `show_menu_on_left_click` says, so the menu is
@@ -312,11 +318,19 @@ pub fn build_menu(app: &AppHandle, state: &AppState) -> Result<Menu<Wry>, tauri:
     let sep2 = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, ID_QUIT, "Quit", true, None::<&str>)?;
 
+    // (S15) Present only while somebody is waiting to be let in, and at the
+    // top level so it is seen: with the approval dialog gone, this entry (and
+    // the tooltip) is how a tray-only user learns that a new agent knocked.
+    let knocks_submenu = build_knocks_submenu(app, state)?;
+
     let mut entries: Vec<&dyn IsMenuItem<Wry>> = Vec::new();
     for j in &jack_items {
         entries.push(j);
     }
     entries.push(&sep1);
+    if let Some(k) = &knocks_submenu {
+        entries.push(k);
+    }
     entries.push(&settings);
     entries.push(&about);
     entries.push(&sep2);
@@ -558,6 +572,50 @@ fn next_delete_client_id(app: &AppHandle) -> String {
     format!("delete_client:{}", n)
 }
 
+/// (S15) Build the "New agents waiting [N]" submenu: one "Allow '<name>'" item
+/// per identity that tried to connect while "Require approval for new agents"
+/// was on, newest first, then "Dismiss all". `None` when nobody is waiting, so
+/// the menu carries no empty entry.
+///
+/// This is what replaced the first-connection dialog. The dialog interrupted
+/// whatever the user was doing and made them answer; this waits until they
+/// look, and not answering costs nothing — the identity simply stays out.
+fn build_knocks_submenu(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<Option<Submenu<Wry>>, tauri::Error> {
+    let knocks = state.knocks_snapshot();
+    if let Some(items) = app.try_state::<TrayItems>() {
+        items.knocks.lock().clear();
+    }
+    if knocks.is_empty() {
+        return Ok(None);
+    }
+
+    let mut entries: Vec<Box<dyn IsMenuItem<Wry>>> = Vec::new();
+    for (n, knock) in knocks.iter().rev().enumerate() {
+        let id = format!("knock:{}", n);
+        let label = format!("Allow '{}'", knock.name);
+        let item = MenuItem::with_id(app, id.as_str(), label.as_str(), true, None::<&str>)?;
+        if let Some(items) = app.try_state::<TrayItems>() {
+            items.knocks.lock().insert(id, knock.name.clone());
+        }
+        entries.push(Box::new(item));
+    }
+    entries.push(Box::new(PredefinedMenuItem::separator(app)?));
+    entries.push(Box::new(MenuItem::with_id(
+        app,
+        ID_KNOCK_DISMISS_ALL,
+        "Dismiss all",
+        true,
+        None::<&str>,
+    )?));
+
+    let refs: Vec<&dyn IsMenuItem<Wry>> = entries.iter().map(|b| b.as_ref()).collect();
+    let label = format!("New agents waiting [{}]", knocks.len());
+    Ok(Some(Submenu::with_items(app, label.as_str(), true, &refs)?))
+}
+
 /// Build the S11 "Forbidden (N)" submenu: one `CheckMenuItem` per EVERY seen
 /// client identity (not just currently-forbidden ones), so Forbidden is a
 /// symmetric on/off control over every known agent. The checkbox mirrors
@@ -679,6 +737,12 @@ pub fn on_menu_event(app: &AppHandle, event: MenuEvent) {
         on_delete_client_click(app, id);
         return;
     }
+    // (S15) "Allow '<name>'" items use an OPAQUE id; resolve the waiting
+    // identity from the knocks lookup table.
+    if id.starts_with("knock:") {
+        on_knock_allow_click(app, id);
+        return;
+    }
     match id {
         ID_RETRY_GATEWAY => on_retry_gateway(app),
         ID_RELOAD => on_reload(app),
@@ -693,6 +757,7 @@ pub fn on_menu_event(app: &AppHandle, event: MenuEvent) {
         ID_MODE_TRAY => on_interface_click(app, UiMode::Tray),
         ID_MODE_WINDOW => on_interface_click(app, UiMode::Window),
         ID_MODE_BOTH => on_interface_click(app, UiMode::Both),
+        ID_KNOCK_DISMISS_ALL => on_knock_dismiss_all(app),
         ID_QUIT => on_quit(app),
         _ => {}
     }
@@ -719,7 +784,7 @@ pub fn tooltip_text(app: &AppHandle) -> String {
     let patched = lines.iter().filter(|l| l.patched).count();
     let total = lines.len();
     let port = state.config.read().port;
-    if total == 0 {
+    let base = if total == 0 {
         format!(
             "Patchbay — no servers configured · http://127.0.0.1:{}/mcp",
             port
@@ -729,6 +794,13 @@ pub fn tooltip_text(app: &AppHandle) -> String {
             "Patchbay — {}/{} patched · http://127.0.0.1:{}/mcp",
             patched, total, port
         )
+    };
+    // (S15) Nothing pops up when an unknown agent is turned away any more, so
+    // the icon has to say that one is waiting.
+    match state.knocks_snapshot().len() {
+        0 => base,
+        1 => format!("{} · 1 new agent waiting", base),
+        n => format!("{} · {} new agents waiting", base, n),
     }
 }
 
@@ -1234,6 +1306,33 @@ fn on_request_logging_click(app: &AppHandle) {
     );
 }
 
+/// (S15) An "Allow '<name>'" item was clicked: let that waiting identity in as
+/// a new agent. [`AppState::approve_knock`] fans out by itself, which rebuilds
+/// this menu without the entry.
+fn on_knock_allow_click(app: &AppHandle, id: &str) {
+    let Some(state) = app_state(app) else {
+        return;
+    };
+    let name = app
+        .try_state::<TrayItems>()
+        .and_then(|items| items.knocks.lock().get(id).cloned());
+    let Some(name) = name else {
+        log(&format!("tray: allow click on unknown id '{}' (stale menu?)", id));
+        return;
+    };
+    if let Err(e) = state.approve_knock(&name) {
+        log(&format!("tray: could not let '{}' in: {}", name, e));
+    }
+}
+
+/// (S15) "Dismiss all": forget everyone who is waiting. Nothing is recorded,
+/// so an identity that knocks again simply waits again.
+fn on_knock_dismiss_all(app: &AppHandle) {
+    if let Some(state) = app_state(app) {
+        state.clear_knocks();
+    }
+}
+
 /// A "Forbidden" per-identity toggle checkbox was clicked (S11). Same "intent
 /// is not state" discipline as [`on_jack_click`]/[`on_override_click`]: muda
 /// already flipped the box, so read the AUTHORITATIVE `is_forbidden` value from
@@ -1361,8 +1460,7 @@ fn on_enable_custom_click(app: &AppHandle, id: &str) {
 /// update. On cancel/no: does nothing.
 ///
 /// The confirm dialog is a BLOCKING `MessageBoxW` running its own modal message
-/// loop, so — exactly like [`AppState::ensure_client_approved`] does for the
-/// first-connection approval dialog — it runs on a plain `std::thread::spawn`,
+/// loop, so it runs on a plain `std::thread::spawn`,
 /// NOT on the tauri main/event thread (which would freeze the tray while the
 /// dialog is up) and NOT on the tokio runtime. The async hand-off
 /// (`delete_client` + full menu rebuild) happens inside
@@ -1518,7 +1616,17 @@ fn build_minimal_menu(app: &AppHandle, state: &AppState) -> Result<Menu<Wry>, ta
     let reload = MenuItem::with_id(app, ID_RELOAD, "Reload config", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, ID_QUIT, "Quit", true, None::<&str>)?;
-    let entries: Vec<&dyn IsMenuItem<Wry>> = vec![&show, &interface, &reload, &sep, &quit];
+    // (S15) The one exception to "minimal": somebody waiting to be let in is
+    // shown here too, so the icon's menu never hides it.
+    let knocks_submenu = build_knocks_submenu(app, state)?;
+    let mut entries: Vec<&dyn IsMenuItem<Wry>> = vec![&show];
+    if let Some(k) = &knocks_submenu {
+        entries.push(k);
+    }
+    entries.push(&interface);
+    entries.push(&reload);
+    entries.push(&sep);
+    entries.push(&quit);
     Menu::with_items(app, &entries)
 }
 

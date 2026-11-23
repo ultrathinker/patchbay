@@ -129,6 +129,27 @@
     return "no session history";
   }
 
+  /** One live helper of an agent: what it was granted and when it last moved. */
+  function helperMeta(helper) {
+    var what =
+      helper.jacks === "none"
+        ? "no servers granted"
+        : helper.jacks === "*"
+        ? "all of its owner's servers"
+        : helper.jacks;
+    var text = what + " · active " + ago(helper.idle_secs || 0);
+    if (helper.sessions > 1) text += " · " + helper.sessions + " sessions";
+    return text;
+  }
+
+  /** One identity waiting to be let in. */
+  function knockMeta(knock) {
+    var text = "tried to connect " + (agoFromDate(knock.last_seen) || "just now");
+    if (knock.count > 1) text += " · " + plural(knock.count, "time", "times");
+    if (knock.version) text += " · v" + knock.version;
+    return text;
+  }
+
   function jackMeta(jack) {
     var t = jack.transport === "stdio" ? "local" : "http";
     if (jack.error) return t + " · " + jack.error;
@@ -375,6 +396,50 @@
     `;
   }
 
+  /** A script or subagent working for an agent right now. Not a button: there
+   *  is nothing to configure — it holds what its owner handed it, and it is
+   *  gone from this list when it stops. */
+  function HelperRow(props) {
+    var h = props.helper;
+    return html`
+      <div class="row row--helper" title=${"Connected as " + props.owner + "/" + h.label}>
+        <span class="dot running" aria-hidden="true"></span>
+        <span class="row-body">
+          <span class="row-name">${h.label}</span>
+          <span class="row-meta">${helperMeta(h)}</span>
+        </span>
+        <span class="chip">Helper</span>
+      </div>
+    `;
+  }
+
+  /** An identity that was turned away and is waiting for a decision. */
+  function KnockRow(props) {
+    var k = props.knock;
+    return html`
+      <div class="row row--knock">
+        <span class="row-body">
+          <span class="row-name">${k.name}</span>
+          <span class="row-meta">${knockMeta(k)}</span>
+        </span>
+        <button
+          class="btn primary"
+          title="Let it in as a new agent"
+          onClick=${function () { props.onAllow(k); }}
+        >
+          Allow
+        </button>
+        <button
+          class="btn"
+          title="Forget this attempt. It can try again."
+          onClick=${function () { props.onDismiss(k); }}
+        >
+          Dismiss
+        </button>
+      </div>
+    `;
+  }
+
   function AgentsScreen(props) {
     var snapshot = props.snapshot;
     var q = props.query.trim().toLowerCase();
@@ -401,22 +466,47 @@
       return props.order.indexOf(a.name) === -1;
     });
 
+    var knocks = snapshot.knocks || [];
+    var waiting =
+      knocks.length > 0 &&
+      html`
+        <div class="subhead">Waiting to be let in</div>
+        ${knocks.map(function (k) {
+          return html`
+            <${KnockRow}
+              key=${k.name}
+              knock=${k}
+              onAllow=${props.onAllowKnock}
+              onDismiss=${props.onDismissKnock}
+            />
+          `;
+        })}
+        <div class="hint">
+          Allow only a real new agent. A script or subagent of an agent you already
+          have should connect as Owner/label instead — that needs no approval.
+        </div>
+      `;
+
     if (snapshot.agents.length === 0) {
       return html`
-        <div class="empty">
-          <p>
-            No agent has connected yet. Point one at
-            http://127.0.0.1:${snapshot.gateway.port}/mcp
-          </p>
-          <button class="btn primary" onClick=${function () { invoke("ui_copy_url"); }}>
-            Copy URL
-          </button>
+        <div class="list">
+          ${waiting}
+          <div class="empty">
+            <p>
+              No agent has connected yet. Point one at
+              http://127.0.0.1:${snapshot.gateway.port}/mcp
+            </p>
+            <button class="btn primary" onClick=${function () { invoke("ui_copy_url"); }}>
+              Copy URL
+            </button>
+          </div>
         </div>
       `;
     }
 
     return html`
       <div class="list">
+        ${waiting}
         ${arrivals.length > 0 &&
         html`
           <button class="row" onClick=${props.onAcceptArrivals}>
@@ -440,6 +530,15 @@
               selected=${props.selected.indexOf(a.name) !== -1}
               onClick=${function () { props.onRowClick(a); }}
             />
+            ${(a.helpers || []).map(function (h) {
+              return html`
+                <${HelperRow}
+                  key=${a.name + "/" + h.label + "/" + h.jacks}
+                  owner=${a.name}
+                  helper=${h}
+                />
+              `;
+            })}
           `;
         })}
       </div>
@@ -535,6 +634,19 @@
           </span>
         </button>
 
+        ${(a.helpers || []).length > 0 &&
+        html`
+          <div class="subhead">Working for this agent now</div>
+          ${a.helpers.map(function (h) {
+            return html`
+              <${HelperRow}
+                key=${h.label + "/" + h.jacks}
+                owner=${a.name}
+                helper=${h}
+              />
+            `;
+          })}
+        `}
       </div>
     `;
   }
@@ -813,7 +925,7 @@
           <${Switch} on=${s.require_approval} label="Require approval for new agents" />
           <span class="row-body">
             <span class="row-name">Require approval for new agents</span>
-            <span class="row-meta">Ask once when an unknown identity connects.</span>
+            <span class="row-meta">Turn an unknown identity away until you let it in under Agents.</span>
           </span>
         </button>
 
@@ -863,7 +975,10 @@
     }
     return html`
       <div class="footer">
-        ${tab("jacks", "Jacks")} ${tab("agents", "Agents " + props.agentCount)}
+        ${tab("jacks", "Jacks")} ${tab(
+          "agents",
+          "Agents " + props.agentCount + (props.waitingCount > 0 ? " +" + props.waitingCount : "")
+        )}
         ${tab("settings", "Settings")}
         <span class="spacer"></span>
         <button class="link" title="Open the logs folder" onClick=${function () { invoke("ui_open_logs"); }}>
@@ -1312,6 +1427,8 @@
             selectMode=${selectMode}
             selected=${selected}
             onAcceptArrivals=${function () { setOrder(sortedAgentNames(snapshot.agents)); }}
+            onAllowKnock=${function (k) { call("ui_approve_knock", { name: k.name }); }}
+            onDismissKnock=${function (k) { call("ui_dismiss_knock", { name: k.name }); }}
             onRowClick=${function (a) {
               if (selectMode) {
                 var next = selected.slice();
@@ -1413,6 +1530,7 @@
         <${Footer}
           screen=${screen === "add" ? "jacks" : screen}
           agentCount=${snapshot.agents.length}
+          waitingCount=${(snapshot.knocks || []).length}
           reloading=${reloading}
           onReload=${reloadConfig}
           onScreen=${function (k) {

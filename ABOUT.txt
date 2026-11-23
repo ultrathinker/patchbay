@@ -49,8 +49,9 @@ asking. Every agent that connects gets an identity — either a name it
 reports about itself, or, better, a stable label you choose yourself (see
 "Identifying agents" below) — and Patchbay remembers every identity it
 has ever seen. That identity is what everything else in this file builds
-on: per-agent permission lists, a connect-approval prompt, and the
-ability to fully forget an agent you no longer use.
+on: per-agent permission lists, a connect-approval gate, helpers that
+act for an agent, and the ability to fully forget an agent you no longer
+use.
 
 IDENTIFYING AGENTS
 -------------------
@@ -75,13 +76,42 @@ personal vs. a work Claude Code profile).
 CONNECT APPROVAL
 ------------------
 Settings > "Require approval for new agents" (off by default). When
-turned on, the FIRST time an identity Patchbay has never seen tries to
-connect, a system dialog pops up asking Allow or Deny before it gets any
-tools. Allow remembers it as a normal seen agent; Deny adds it straight
-to the Forbidden list (see below) so it's rejected automatically from
-then on, with no further prompts. Once an identity has been seen once
-(allowed or not), it never triggers this dialog again — managing it after
-that is done from the tray, not through pop-ups.
+turned on, an identity Patchbay has never seen is turned away when it
+tries to connect: it gets no session and no tools, and it is told why.
+Nothing pops up. The identity appears under "Waiting to be let in" at
+the top of the window's Agents screen and in the tray menu as "New
+agents waiting", and the tray tooltip says that someone is waiting.
+Allow lets it in as a normal agent (it connects on its next attempt);
+Dismiss forgets the attempt. An identity you neither allow nor dismiss
+simply stays out: nothing about it is written to disk, and the list is
+emptied when Patchbay restarts.
+
+SCRIPTS AND SUBAGENTS (HELPERS)
+--------------------------------
+Agents write scripts, and start other agents, that talk to Patchbay on
+their own. Such a caller must not make up a name for itself. It says
+whose it is, with two HTTP headers on its first request:
+
+    X-Patchbay-Client: <owner>/<label>
+    X-Patchbay-Jacks: <server>, <server>        (or * for all)
+
+<owner> is the exact name the agent itself connects under; <label> is
+any short text. When the owner is an agent Patchbay already knows, the
+caller is that agent's HELPER:
+
+  - it needs no approval and adds nothing to the list of agents; it is
+    shown under its owner in the window only while it is connected;
+  - it gets NO servers unless the owner names them in X-Patchbay-Jacks
+    (a comma-separated list; * means all of the owner's; add "patchbay"
+    for Patchbay's own management tools);
+  - it can use a named server only while its owner can. A helper never
+    has more than its owner, and loses a server when its owner does.
+
+Patchbay tells every agent its own name and this rule when the agent
+connects, so you do not have to. A subagent started from the same agent
+profile uses the same MCP config, so it connects as the agent itself; to
+hold it to a subset, start it with its own MCP config carrying the two
+headers.
 
 SETTINGS & MENU GUIDE
 ----------------------

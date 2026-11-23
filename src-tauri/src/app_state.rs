@@ -54,12 +54,11 @@ pub struct AppState {
     /// `patchbay.json`; see [`AppState::touch_client_last_seen`].
     pub last_seen_touch: Arc<Mutex<HashMap<String, Instant>>>,
 
-    /// In-flight first-connection approval dialogs (S10c), keyed by the client
-    /// identity the dialog is asking about. A concurrent `initialize` for the
-    /// SAME not-yet-decided identity `subscribe()`s to the stored sender instead
-    /// of popping a second dialog. Entry is removed the moment the decision is
-    /// applied (see [`Self::apply_approval_decision`]).
-    pub pending_approvals: Arc<Mutex<HashMap<String, ApprovalSender>>>,
+    /// (S15) Identities that tried to connect while "Require approval for new
+    /// agents" was on and were turned away. In memory only, newest last, at
+    /// most [`MAX_KNOCKS`]: a knock is a question waiting for the user, not
+    /// configuration. See [`Self::admit_client`].
+    pub knocks: Arc<Mutex<Vec<Knock>>>,
 
     /// A config reload is running right now (PBAY-1). The button gave no sign
     /// that anything was happening, so it was pressed again and again, and every
@@ -68,11 +67,37 @@ pub struct AppState {
     pub reloading: Arc<AtomicBool>,
 }
 
-/// One pending approval dialog (S10c): a `tokio::sync::watch` sender carrying
-/// `None` until the dialog resolves, then `Some(true)` (Allow) or
-/// `Some(false)` (Deny). Concurrent `initialize` requests for the same identity
-/// `subscribe()` to the same sender so only ONE dialog is ever shown.
-type ApprovalSender = tokio::sync::watch::Sender<Option<bool>>;
+/// (S15) One identity waiting to be let in: it connected under a name
+/// Patchbay did not know while the approval gate was on.
+#[derive(Clone, Debug)]
+pub struct Knock {
+    pub name: String,
+    /// `clientInfo.version` from the most recent attempt (display only).
+    pub version: Option<String>,
+    /// RFC3339 timestamp of the most recent attempt.
+    pub last_seen: String,
+    /// How many times it has tried.
+    pub count: u32,
+}
+
+/// (S15) How many waiting identities are remembered. A script that invents a
+/// fresh name on every run pushes the oldest ones out instead of growing the
+/// list -- the unbounded growth of exactly this kind of entry is what the
+/// waiting list exists to end.
+pub const MAX_KNOCKS: usize = 20;
+
+/// (S15) What [`AppState::admit_client`] decided about a caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admission {
+    /// Already in `seen_clients`.
+    Known,
+    /// In `forbidden_clients`: it gets a session and sees nothing.
+    Forbidden,
+    /// New, and the approval gate is off: recorded just now.
+    Recorded,
+    /// New, and the approval gate is on: refused, and noted for the user.
+    Waiting,
+}
 
 /// (S13) Minimum interval between two persisted `SeenClient::last_seen`
 /// refreshes for the SAME client. A reconnect storm or a chatty agent must not
@@ -209,7 +234,7 @@ impl AppState {
             tray_handle: Arc::new(RwLock::new(None)),
             agent_tombstone: Arc::new(Mutex::new(None)),
             last_seen_touch: Arc::new(Mutex::new(HashMap::new())),
-            pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+            knocks: Arc::new(Mutex::new(Vec::new())),
             reloading: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -1141,6 +1166,32 @@ impl AppState {
         self.notify_state_changed();
     }
 
+    /// (S15) A helper session just came up. Nothing is recorded — a helper
+    /// exists only while it is connected — but the window lists live helpers
+    /// under their owner, so it has to hear about a new one.
+    ///
+    /// Throttled per helper like [`Self::touch_client_last_seen`], and for the
+    /// same reason: a script that reconnects in a loop must not become a
+    /// notification storm. `display_name` is `Owner/label`.
+    pub fn note_helper_connected(&self, display_name: &str) {
+        {
+            let mut touched = self.last_seen_touch.lock();
+            if let Some(prev) = touched.get(display_name) {
+                if prev.elapsed().as_secs() < LAST_SEEN_THROTTLE_SECS {
+                    return;
+                }
+            }
+            // Helper labels are free text, so this map is the one thing here a
+            // caller could grow. Entries past the throttle window carry no
+            // information; drop them once there are many.
+            if touched.len() > 256 {
+                touched.retain(|_, at| at.elapsed().as_secs() < LAST_SEEN_THROTTLE_SECS);
+            }
+            touched.insert(display_name.to_string(), Instant::now());
+        }
+        self.notify_state_changed();
+    }
+
     /// Persist a candidate config — the ONLY way this type writes to disk.
     ///
     /// (B-1) When the file on disk failed to parse at startup, the config held
@@ -1363,48 +1414,28 @@ impl AppState {
         Ok(())
     }
 
-    // ---- S10c: first-connection approval gate + forbidden clients -----------
+    // ---- S15: who gets in ----------------------------------------------------
     //
-    // `ensure_client_approved` is the gate in front of `record_seen_client`: for
-    // a NEW identity (not in seen_clients, not forbidden) with the gate ON, it
-    // blocks the `initialize` request on a native Win32 dialog until the user
-    // answers. The dialog itself runs on a plain std thread (MessageBoxW blocks)
-    // and signals the result back via a watch channel. Concurrent initialize
-    // retries for the SAME not-yet-decided identity JOIN the same pending
-    // decision (subscribe) instead of popping a second dialog. The decision is
-    // APPLIED by `apply_approval_decision`; un-forbidding a client later is
-    // `remove_forbidden_client`.
+    // `admit_client` is the door for an identified caller that is NOT a helper
+    // (helpers never reach it -- see `gateway::helper`). It replaces the S10c
+    // approval dialog. That dialog blocked `initialize` on a system-modal
+    // Allow/Deny box, and whichever button was pressed left a permanent record:
+    // an invented script name answered Yes became an agent holding the GLOBAL
+    // list, answered No became a forbidden entry. Now an unknown name is
+    // refused with instructions it can act on, and waits in a short in-memory
+    // list until the user lets it in by hand. Nothing is written unless the
+    // user asks for it.
 
-    /// First-connection approval gate (S10c). Called from `handle_initialize`
-    /// AFTER the client identity is resolved (header priority). `version` is the
-    /// connecting agent's `clientInfo.version` (display-only), threaded in so an
-    /// Allow decision records it. Fast paths (no dialog needed):
-    /// - the gate is OFF (`require_approval_for_new_clients == false`) -> the
-    ///   identity is auto-added to `seen_clients` immediately (unchanged S10
-    ///   behavior) via [`Self::record_seen_client`];
-    /// - the identity is already in `seen_clients` (a prior Allow stands);
-    /// - the identity is already in `forbidden_clients` (a prior Deny stands).
+    /// Classify an identified, non-helper caller at `initialize`.
     ///
-    /// Otherwise the FIRST requester for an identity spawns the blocking dialog
-    /// thread and awaits its decision; concurrent requesters for the same
-    /// not-yet-decided identity subscribe to the SAME decision (no second
-    /// dialog). Resolves when the user has answered (the `initialize` request
-    /// stays pending for that one async task; other clients are unaffected).
-    ///
-    /// On Allow the thread records the client in `seen_clients` (atomically, with
-    /// the version) so a concurrent retry immediately sees it as "known" (closing
-    /// the race between signaling Allow and the next `initialize`). On Deny the
-    /// identity lands in `forbidden_clients` — the agent gets zero tools but
-    /// `initialize` still completes (no transport-level failure).
-    pub async fn ensure_client_approved(&self, name: &str, version: Option<&str>) {
-        if name.is_empty() {
-            return;
-        }
-
-        // Fast path: decide whether a dialog is needed at all, under one config
-        // read. Gate OFF, or the identity is already known/forbidden -> no
-        // dialog (a previous decision stands). Gate OFF additionally auto-adds
-        // the client to seen_clients (today's S10 behavior).
+    /// - forbidden -> [`Admission::Forbidden`]: a session is still created and
+    ///   sees nothing (unchanged since S10c);
+    /// - already in `seen_clients` -> [`Admission::Known`];
+    /// - new, approval gate OFF -> recorded on the spot (unchanged S10
+    ///   behavior), [`Admission::Recorded`];
+    /// - new, approval gate ON -> noted in the waiting list,
+    ///   [`Admission::Waiting`]; the caller gets no session.
+    pub fn admit_client(&self, name: &str, version: Option<&str>) -> Admission {
         let (gate_on, known, forbidden) = {
             let cfg = self.config.read();
             (
@@ -1413,181 +1444,113 @@ impl AppState {
                 cfg.is_forbidden(Some(name)),
             )
         };
+        if forbidden {
+            return Admission::Forbidden;
+        }
+        if known {
+            return Admission::Known;
+        }
         if !gate_on {
-            // Gate OFF + not yet known + not forbidden -> auto-record (no dialog).
-            if !known && !forbidden {
-                self.record_seen_client(name, version);
-            }
-            return;
+            self.record_seen_client(name, version);
+            return Admission::Recorded;
         }
-        if known || forbidden {
-            return;
-        }
-
-        // Slow path: a dialog IS needed. Either join an already-pending decision
-        // for the SAME identity (concurrent initialize retries), or become the
-        // first requester and spawn the blocking dialog thread. The lock is held
-        // only for the map bookkeeping (insert / subscribe), never across the
-        // await below.
-        let rx: tokio::sync::watch::Receiver<Option<bool>> = {
-            let mut pending = self.pending_approvals.lock();
-            if let Some(tx) = pending.get(name) {
-                // A dialog for this identity is already up — do NOT pop a second
-                // one. Join the same pending decision (watch receivers are
-                // cheaply cloneable via subscribe()).
-                tx.subscribe()
-            } else {
-                // First requester: create the channel, register it, and spawn the
-                // blocking dialog on a plain std thread (NOT the tokio runtime —
-                // MessageBoxW runs its own modal loop and would stall an async
-                // worker). The thread owns applying the decision + signaling
-                // every awaiter, so a cancelled initialize task cannot strand
-                // the decision.
-                let (tx, rx) = tokio::sync::watch::channel(None::<bool>);
-                pending.insert(name.to_string(), tx);
-                let state2 = self.clone();
-                let name_owned = name.to_string();
-                let version_owned = version.map(str::to_owned);
-                let handle_for_dialog = self.tray_handle.read().clone();
-                std::thread::spawn(move || {
-                    // (S13 §4.7) The popover is always-on-top; a modal Win32
-                    // dialog raised underneath it looks like a frozen machine.
-                    // Step it aside for the duration of the prompt.
-                    if let Some(h) = &handle_for_dialog {
-                        crate::window::set_yielding(h, true);
-                    }
-                    let allowed = crate::approval::show_approval_dialog(&name_owned);
-                    if let Some(h) = &handle_for_dialog {
-                        crate::window::set_yielding(h, false);
-                    }
-                    state2.apply_approval_decision(&name_owned, version_owned.as_deref(), allowed);
-                });
-                rx
-            }
-        };
-
-        // Wait for the thread to signal the decision (Some(allowed)). Concurrent
-        // joiners and the first requester all end up here. watch::wait_for
-        // returns as soon as the current value satisfies the predicate; after
-        // `send` the value is Some and this resolves immediately.
-        let mut rx = rx;
-        if rx.wait_for(|v| v.is_some()).await.is_err() {
-            // All senders dropped without a value (shouldn't happen: the thread
-            // always sends before removing the sender). Fall through leniently —
-            // a not-forbidden identity still completes initialize.
-            log("ensure_client_approved: decision channel closed without a value");
-        }
+        self.record_knock(name, version);
+        Admission::Waiting
     }
 
-    /// Apply a first-connection approval decision (S10c). Called from the std
-    /// thread that ran the dialog (so it must be safe off the tokio runtime —
-    /// parking_lot locks + plain `config::save` are). This is the testable
-    /// DECISION-LOGIC half, separated from the blocking `show_approval_dialog`
-    /// side effect.
-    ///
-    /// - `allowed == true`: adds the identity to `seen_clients` (idempotent, with
-    ///   `version`) so a concurrent initialize retry immediately sees it as
-    ///   "known" (closing the race between signaling Allow and the next request),
-    ///   AND defensively clears any stale `forbidden_clients` entry for it.
-    /// - `allowed == false`: appends the identity to `forbidden_clients`
-    ///   (idempotent) and NEVER to `seen_clients`.
-    ///
-    /// Then signals every awaiter of the decision (first requester + concurrent
-    /// joiners) and clears the pending entry so the next new identity (or a
-    /// reconnect after a later un-forbid) gets a fresh dialog. Persists + (when
-    /// the config changed) rebuilds the tray so the "Custom (N)" / "Forbidden
-    /// (N)" counts are live.
-    fn apply_approval_decision(&self, name: &str, version: Option<&str>, allowed: bool) {
-        // 1. Build a candidate snapshot from a READ (no mutation of the live
-        //    config yet), matching the save-then-commit discipline used by
-        //    add_jack/remove_jack/set_forbidden: persist FIRST, only commit to
-        //    the live config if the disk write actually succeeds, so a failed
-        //    `persist` can never leave memory and disk diverged. On
-        //    Allow: record seen_clients (with version) + clear stale
-        //    forbidden. On Deny: add to forbidden.
-        let (candidate, changed) = {
-            let cfg = self.config.read();
-            let mut candidate = cfg.clone();
-            let changed = if allowed {
-                let mut changed = false;
-                if !candidate.seen_clients.iter().any(|c| c.name == name) {
-                    let now = chrono::Local::now().to_rfc3339();
-                    candidate.seen_clients.push(crate::config::SeenClient {
+    /// Note that an unknown identity tried to connect while the approval gate
+    /// was on. A repeat from the same name updates its row and moves it to the
+    /// end, so the front of the list is always the name heard from longest ago
+    /// -- the one dropped when the list is full.
+    pub fn record_knock(&self, name: &str, version: Option<&str>) {
+        if name.is_empty() {
+            return;
+        }
+        let now = chrono::Local::now().to_rfc3339();
+        let is_new = {
+            let mut knocks = self.knocks.lock();
+            match knocks.iter().position(|k| k.name == name) {
+                Some(i) => {
+                    let mut k = knocks.remove(i);
+                    k.count = k.count.saturating_add(1);
+                    k.last_seen = now;
+                    if version.is_some() {
+                        k.version = version.map(str::to_owned);
+                    }
+                    knocks.push(k);
+                    false
+                }
+                None => {
+                    if knocks.len() >= MAX_KNOCKS {
+                        knocks.remove(0);
+                    }
+                    knocks.push(Knock {
                         name: name.to_string(),
-                        first_seen_version: version.map(str::to_owned),
-                        first_seen: now.clone(),
-                        last_seen: Some(now),
+                        version: version.map(str::to_owned),
+                        last_seen: now,
+                        count: 1,
                     });
-                    changed = true;
+                    true
                 }
-                let before = candidate.forbidden_clients.len();
-                candidate.forbidden_clients.retain(|c| c != name);
-                if candidate.forbidden_clients.len() != before {
-                    changed = true;
-                }
-                changed
-            } else if !candidate.forbidden_clients.iter().any(|c| c == name) {
-                candidate.forbidden_clients.push(name.to_string());
-                true
-            } else {
-                false
-            };
-            (candidate, changed)
+            }
         };
-        if changed {
-            if let Err(e) = self.persist(&candidate) {
-                log(&format!("apply_approval_decision: failed to persist: {}", e));
-                // Fail CLOSED, not open: enforcement here is security-relevant
-                // (a Deny must actually block the session `ensure_client_approved`
-                // is about to let through), unlike the pure-consistency mutators
-                // elsewhere that leave memory untouched on a failed save. If we
-                // left memory unmutated here, a disk write failure during a Deny
-                // would silently let the denied identity in for this run (it
-                // would only become forbidden after a LATER successful save) —
-                // worse than the memory/disk divergence this commits instead,
-                // which self-heals on the next successful save.
-                if !allowed {
-                    *self.config.write() = candidate;
-                }
-            } else {
-                *self.config.write() = candidate;
-            }
-        }
-
-        // 2. Signal every awaiter + clear the pending entry. Sending BEFORE the
-        //    sender is dropped (the remove takes ownership) means receivers that
-        //    have not yet polled still observe Some(allowed) via the retained
-        //    last value.
-        {
-            let mut pending = self.pending_approvals.lock();
-            if let Some(tx) = pending.remove(name) {
-                let _ = tx.send(Some(allowed));
-            }
-        }
-
-        // 3. Rebuild the tray menu so "Custom (N)" (Allow added a seen client)
-        //    / "Forbidden (N)" (Deny) reflect the decision live. Gated on
-        //    `changed` so a no-op decision doesn't pointlessly rebuild.
-        if changed {
-            // (S13) One fan-out for both interfaces.
+        // Only a NEW name changes what the user sees (a row in the window, an
+        // entry in the tray's "New agents waiting" submenu). A repeat changes a
+        // counter, and a script retrying in a loop must not turn into a
+        // menu-rebuild loop.
+        if is_new {
+            log(&format!(
+                "record_knock: unknown client '{}' refused, waiting for the user",
+                name
+            ));
             self.notify_structure_changed();
-
-            #[cfg(not(test))]
-            {
-                let state2 = self.clone();
-                tauri::async_runtime::spawn(async move {
-                    state2.reconcile_all_jack_lifecycles().await;
-                });
-            }
         }
-
-        log(&format!(
-            "apply_approval_decision: '{}' {}",
-            name,
-            if allowed { "allowed -> seen" } else { "denied -> forbidden" }
-        ));
     }
 
+    /// The waiting list, oldest first. Owned data, for the UI.
+    pub fn knocks_snapshot(&self) -> Vec<Knock> {
+        self.knocks.lock().clone()
+    }
+
+    /// Let a waiting identity in as a new agent (the "Allow" button). Only a
+    /// name that actually knocked can be approved this way, so a stale click
+    /// cannot conjure an agent out of nothing.
+    ///
+    /// The new agent follows the global list, like any agent without a Custom
+    /// list of its own -- which is why a script must never be let in this way:
+    /// it should connect as a helper of the agent that wrote it.
+    pub fn approve_knock(&self, name: &str) -> Result<(), String> {
+        let knock = {
+            let mut knocks = self.knocks.lock();
+            match knocks.iter().position(|k| k.name == name) {
+                Some(i) => knocks.remove(i),
+                None => return Err(format!("'{}' is not waiting to be let in", name)),
+            }
+        };
+        self.record_seen_client(&knock.name, knock.version.as_deref());
+        log(&format!("approve_knock: '{}' let in by the user", name));
+        crate::utils::request_log::log_event(
+            self,
+            &format!("new agent '{}' let in by the user", name),
+        );
+        // `record_seen_client` fans out only when it recorded something; the
+        // waiting list changed either way.
+        self.notify_structure_changed();
+        Ok(())
+    }
+
+    /// Forget a waiting identity without letting it in (the "Dismiss" button).
+    /// Nothing is recorded: if it knocks again, it waits again.
+    pub fn dismiss_knock(&self, name: &str) {
+        self.knocks.lock().retain(|k| k.name != name);
+        self.notify_structure_changed();
+    }
+
+    /// Forget every waiting identity at once (the tray's "Dismiss all").
+    pub fn clear_knocks(&self) {
+        self.knocks.lock().clear();
+        self.notify_structure_changed();
+    }
 
     /// Toggle whether a client identity is forbidden (S11 tray "Forbidden"
     /// submenu redesign). `forbidden == true` appends the identity to
@@ -2426,82 +2389,128 @@ mod tests {
         assert_eq!(cfg.seen_clients.len(), 2);
     }
 
-    // ---- S10c: approval decision logic + forbidden clients ----
-    //
-    // The blocking `show_approval_dialog` itself can't be unit-tested without a
-    // live Windows session; the DECISION LOGIC it feeds (allow/deny → config;
-    // the fast-path gate; un-forbid) is exercised here. `apply_approval_decision`
-    // is called directly (the same function the dialog thread calls).
+    // ---- S15: admission + the waiting list ----
 
-    #[tokio::test]
-    async fn ensure_client_approved_fast_paths_skip_the_dialog() {
+    #[test]
+    fn admit_client_classifies_every_caller() {
         isolate_config();
 
-        // Gate OFF + new identity -> auto-adds to seen_clients (today's S10
-        // behavior), no dialog, nothing forbidden.
+        // Gate OFF + new identity -> recorded on the spot (today's S10
+        // behavior), nothing waiting, nothing forbidden.
         let st = state_two_jacks();
         st.config.write().require_approval_for_new_clients = false;
-        st.ensure_client_approved("brand-new", None).await;
-        assert!(
-            st.config.read().seen_clients.iter().any(|c| c.name == "brand-new"),
-            "gate OFF auto-records the client"
-        );
+        assert_eq!(st.admit_client("brand-new", None), Admission::Recorded);
+        assert!(st.config.read().seen_clients.iter().any(|c| c.name == "brand-new"));
         assert!(st.config.read().forbidden_clients.is_empty());
+        assert!(st.knocks_snapshot().is_empty());
 
-        // Gate ON but identity already seen -> no dialog, no new entry.
+        // Gate ON, identity already seen -> known, no new entry anywhere.
         let st2 = state_two_jacks();
         st2.record_seen_client("known", None);
+        st2.config.write().require_approval_for_new_clients = true;
         let before = st2.config.read().seen_clients.len();
-        st2.ensure_client_approved("known", None).await;
+        assert_eq!(st2.admit_client("known", None), Admission::Known);
         assert_eq!(st2.config.read().seen_clients.len(), before);
+        assert!(st2.knocks_snapshot().is_empty());
 
-        // Gate ON but identity already forbidden -> no dialog, stays forbidden
-        // and is NOT recorded as seen.
+        // Gate ON, identity forbidden -> stays forbidden, is not recorded and
+        // does not start waiting (the user already answered).
         let st3 = state_two_jacks();
+        st3.config.write().require_approval_for_new_clients = true;
         st3.config.write().forbidden_clients.push("banned".to_string());
-        st3.ensure_client_approved("banned", None).await;
-        assert!(st3.config.read().is_forbidden(Some("banned")));
-        assert!(
-            !st3.config.read().seen_clients.iter().any(|c| c.name == "banned"),
-            "a forbidden identity is not recorded as seen"
-        );
+        assert_eq!(st3.admit_client("banned", None), Admission::Forbidden);
+        assert!(!st3.config.read().seen_clients.iter().any(|c| c.name == "banned"));
+        assert!(st3.knocks_snapshot().is_empty());
     }
 
     #[test]
-    fn apply_approval_decision_deny_adds_to_forbidden_not_seen() {
+    fn an_unknown_name_waits_instead_of_being_recorded() {
+        // The whole point of S15: with the gate on, an invented name leaves no
+        // permanent trace -- not in seen_clients, not in forbidden_clients.
         isolate_config();
         let st = state_two_jacks();
-        // Apply a Deny decision directly (the decision logic, not the dialog).
-        st.apply_approval_decision("rogue", None, false);
-        let cfg = st.config.read();
-        assert!(cfg.is_forbidden(Some("rogue")), "denied -> forbidden");
-        assert!(
-            !cfg.seen_clients.iter().any(|c| c.name == "rogue"),
-            "a denied agent must NOT land in seen_clients"
-        );
-    }
+        st.config.write().require_approval_for_new_clients = true;
 
-    #[test]
-    fn apply_approval_decision_allow_adds_to_seen_and_clears_forbidden() {
-        isolate_config();
-        let st = state_two_jacks();
-        // Pre-seed a stale forbidden entry; an Allow decision must clear it AND
-        // record the identity in seen_clients (so a concurrent retry sees it as
-        // known), carrying the version.
-        st.config.write().forbidden_clients.push("maybe".to_string());
-        st.apply_approval_decision("maybe", Some("1.2.3"), true);
+        assert_eq!(st.admit_client("orchestrator", Some("1")), Admission::Waiting);
+
         let cfg = st.config.read();
-        assert!(!cfg.is_forbidden(Some("maybe")));
-        let maybe = cfg.seen_clients.iter().find(|c| c.name == "maybe").unwrap();
-        assert_eq!(maybe.first_seen_version.as_deref(), Some("1.2.3"));
+        assert!(cfg.seen_clients.is_empty(), "an unknown name must not be recorded");
+        assert!(cfg.forbidden_clients.is_empty(), "nor forbidden");
         drop(cfg);
+        let knocks = st.knocks_snapshot();
+        assert_eq!(knocks.len(), 1);
+        assert_eq!(knocks[0].name, "orchestrator");
+        assert_eq!(knocks[0].version.as_deref(), Some("1"));
+        assert_eq!(knocks[0].count, 1);
+    }
 
-        // A clean Allow adds to seen with the given version, forbids nothing.
-        st.apply_approval_decision("fresh", None, true);
+    #[test]
+    fn a_repeat_knock_updates_its_row_instead_of_adding_one() {
+        let st = state_two_jacks();
+        st.record_knock("probe", None);
+        st.record_knock("other", None);
+        st.record_knock("probe", Some("2"));
+        let knocks = st.knocks_snapshot();
+        assert_eq!(knocks.len(), 2);
+        // The repeat moved to the end: the front is the one heard from longest ago.
+        assert_eq!(knocks[0].name, "other");
+        assert_eq!(knocks[1].name, "probe");
+        assert_eq!(knocks[1].count, 2);
+        assert_eq!(knocks[1].version.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn the_waiting_list_is_bounded() {
+        // A script that invents a new name per run must not grow anything.
+        let st = state_two_jacks();
+        for i in 0..(MAX_KNOCKS + 5) {
+            st.record_knock(&format!("script-{}", i), None);
+        }
+        let knocks = st.knocks_snapshot();
+        assert_eq!(knocks.len(), MAX_KNOCKS);
+        assert_eq!(knocks[0].name, "script-5", "the oldest names were dropped");
+    }
+
+    #[test]
+    fn approve_knock_makes_the_identity_a_known_agent() {
+        isolate_config();
+        let st = state_two_jacks();
+        st.config.write().require_approval_for_new_clients = true;
+        assert_eq!(st.admit_client("Codex", Some("0.145.0")), Admission::Waiting);
+
+        st.approve_knock("Codex").unwrap();
+
         let cfg = st.config.read();
-        assert!(!cfg.is_forbidden(Some("fresh")));
-        let fresh = cfg.seen_clients.iter().find(|c| c.name == "fresh").unwrap();
-        assert_eq!(fresh.first_seen_version.as_deref(), None);
+        let rec = cfg.seen_clients.iter().find(|c| c.name == "Codex").unwrap();
+        assert_eq!(rec.first_seen_version.as_deref(), Some("0.145.0"));
+        drop(cfg);
+        assert!(st.knocks_snapshot().is_empty(), "it is no longer waiting");
+        assert_eq!(st.admit_client("Codex", None), Admission::Known);
+    }
+
+    #[test]
+    fn only_a_name_that_knocked_can_be_approved() {
+        isolate_config();
+        let st = state_two_jacks();
+        assert!(st.approve_knock("never-knocked").is_err());
+        assert!(st.config.read().seen_clients.is_empty());
+    }
+
+    #[test]
+    fn dismissing_a_knock_records_nothing() {
+        isolate_config();
+        let st = state_two_jacks();
+        st.record_knock("probe", None);
+        st.record_knock("bee-put", None);
+
+        st.dismiss_knock("probe");
+        assert_eq!(st.knocks_snapshot().len(), 1);
+        st.clear_knocks();
+        assert!(st.knocks_snapshot().is_empty());
+
+        let cfg = st.config.read();
+        assert!(cfg.seen_clients.is_empty());
+        assert!(cfg.forbidden_clients.is_empty());
     }
 
     #[tokio::test]
@@ -2661,8 +2670,8 @@ mod tests {
     // Unlike disable_custom_client (which preserves the ClientOverride entry
     // with enabled:false), delete_client ERASES the entry. The blocking
     // `show_delete_confirm_dialog` is live-verification-only (it can't be unit-
-    // tested without a live Windows session — same carve-out as
-    // `show_approval_dialog`); the DECISION LOGIC here is what's under test.
+    // tested without a live Windows session); the DECISION LOGIC here is what's
+    // under test.
 
     #[tokio::test]
     async fn delete_client_removes_from_seen_clients() {
@@ -3003,7 +3012,10 @@ mod tests {
             "set_ui_mode",
             "touch_client_last_seen",
             "record_seen_client",
-            "apply_approval_decision",
+            "record_knock",
+            "approve_knock",
+            "dismiss_knock",
+            "clear_knocks",
         ];
 
         for name in MUTATORS {
